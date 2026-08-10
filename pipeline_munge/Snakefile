@@ -22,6 +22,61 @@ study_info = load_study_info(config)
 
 print(f"Running {len(study_info)} studies: {list(study_info.keys())}")
 
+# ---------------------------------------------------------------------------
+# Containerization
+# ---------------------------------------------------------------------------
+# Every rule runs inside the image built from the Dockerfile at the repo root and
+# published to ghcr.io/benaroyaresearch/fm_2026. It carries curl, file, gzip and GNU grep
+# (with PCRE) for the shell rules, and R with MungeSumstats for munge_gwas. The
+# SNPlocs/BSgenome reference data is deliberately not in the image — see config["ref_lib"]
+# below.
+#
+# How the image actually gets applied depends on the executor, and the two paths are not
+# interchangeable:
+#
+#   Kubernetes (how this is deployed, per the Coder workspace docs)
+#       The k8s executor plugin ignores the `container:` directive below. It puts a
+#       single image on every job pod, taken from --container-image, and runs Snakemake
+#       inside that pod to execute the rule. So the image must be named on the command
+#       line as well:
+#
+#           conda activate snakemake
+#           snakemake --profile coder --jobs <n> \
+#                     --container-image ghcr.io/benaroyaresearch/fm_2026:<tag> \
+#                     --latency-wait 120 --keep-going --default-resources
+#
+#       Because the pod re-parses this Snakefile, the image needs Snakemake and pandas
+#       too — the Dockerfile installs both. Drop --use-conda: no rule here declares a
+#       conda env, and dependencies come from the image instead.
+#
+#   Local / Apptainer
+#       `container:` below is the directive Apptainer honors, so a local run works with
+#       --software-deployment-method apptainer and no extra flags. Note that Apptainer
+#       bind-mounts little beyond the working directory, so if $TMPDIR points at scratch,
+#       add --apptainer-args "--bind $TMPDIR" — download_gwas and check_gwas_coverage
+#       stage multi-GB temp files there, and the coverage check decompresses the whole
+#       GWAS.
+#
+# Do not combine `container:` with --sdm apptainer while on the Kubernetes executor. That
+# combination asks for Apptainer nested inside the pod, which makes the plugin request
+# privileged pods, and its own source notes that path does not currently work.
+#
+# Both paths read the same config key, so the declared image and the flag cannot drift.
+if "container" not in config:
+    sys.exit(
+        "ERROR: config/config_munge.yaml is missing the 'container' key.\n"
+        "Set it to the published image, e.g. ghcr.io/benaroyaresearch/fm_2026:v1.0.0"
+    )
+
+if "ref_lib" not in config:
+    sys.exit(
+        "ERROR: config/config_munge.yaml is missing the 'ref_lib' key.\n"
+        "Set it to the shared R library holding the SNPlocs/BSgenome reference data "
+        "packages. See the Dockerfile header for the one-time install command."
+    )
+
+container: config["container"]
+
 # Pipeline ultimately needs to produce:
 #      1. fine-mapping decision file (both functional & regular, regular only, or none)
 #      2. file containing study trait
@@ -224,6 +279,20 @@ rule munge_gwas:
         munged = "results/{study}/munged/{study}_munged.tsv.gz",
         decision = "results/{study}/munged/{study}_fm_decision.txt"
     threads: 4
+    # Worth setting before running this on Kubernetes. The k8s executor turns threads
+    # into the pod's CPU request and mem_mb into both its memory request AND limit; with
+    # no mem_mb the pod is scheduled with no memory reservation at all and is first in
+    # line to be killed under node pressure. That surfaces as exit code 137, which the
+    # error handling below already reports as a likely OOM.
+    #
+    # disk_mb becomes the ephemeral-storage request and limit. It matters here because
+    # check_gwas_coverage decompresses the entire GWAS through mktemp, which lands in the
+    # pod's ephemeral storage unless $TMPDIR points somewhere shared. Either size disk_mb
+    # for the largest uncompressed GWAS, or keep temp files off ephemeral storage with:
+    #
+    #     --default-resources tmpdir="'/path/on/shared/fs'"
+    #
+    # Snakemake exports resources.tmpdir as $TMPDIR for the job, and mktemp honors it.
     # resources:
     #     mem_mb = 32000
 
@@ -235,7 +304,8 @@ rule munge_gwas:
         snp_high = config["finemap_thresholds"]["snp_high"],
         n_mid_low = config["finemap_thresholds"]["n_mid_low"],
         snp_mid_low = config["finemap_thresholds"]["snp_mid_low"],
-        timeout_h = config["munge_timeout_hours"]
+        timeout_h = config["munge_timeout_hours"],
+        ref_lib = config["ref_lib"]
     shell:
         r"""
 
@@ -245,6 +315,25 @@ rule munge_gwas:
             echo "$(date): ERROR - coverage check did not pass, refusing to munge" >> {params.log_path}
             exit 1
         fi
+
+        # The SNPlocs/BSgenome reference data packages are too large to ship in the
+        # container image, so they live in a shared R library on NFS. R_LIBS is prepended
+        # to .libPaths(), leaving the image's own site-library intact. Checked up front
+        # because the alternative is a four-hour job dying on "there is no package called
+        # 'SNPlocs.Hsapiens.dbSNP155.GRCh38'".
+        if [ ! -d "{params.ref_lib}" ]; then
+            echo "$(date): ERROR - reference library {params.ref_lib} not found or not mounted in this container" >> {params.log_path}
+            exit 1
+        fi
+        export R_LIBS="{params.ref_lib}"
+
+        for pkg in SNPlocs.Hsapiens.dbSNP155.GRCh38 SNPlocs.Hsapiens.dbSNP155.GRCh37 \
+                   BSgenome.Hsapiens.NCBI.GRCh38 BSgenome.Hsapiens.1000genomes.hs37d5; do
+            if [ ! -d "{params.ref_lib}/$pkg" ]; then
+                echo "$(date): ERROR - reference package $pkg missing from {params.ref_lib}" >> {params.log_path}
+                exit 1
+            fi
+        done
 
         FNAME=$(cat {input.file_name})
 

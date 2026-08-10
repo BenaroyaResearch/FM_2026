@@ -76,7 +76,24 @@ studies:
   # - "GCST005686"
   # - "GCST90013538"
   # - "GCST90104347" 
-use_functional_annotations: false # Should functional fine-mapping be implemented, if indicated 
+# Container image every rule in pipeline_munge/Snakefile runs inside, built from the
+# Dockerfile at the repo root by .github/workflows/build-image.yaml. Prefer an immutable
+# tag (a release tag, or main-<sha>) over :latest so a rerun months from now uses the
+# same MungeSumstats that produced the results already on disk.
+#
+# On the Kubernetes executor this same value must also be passed as --container-image;
+# the plugin does not read the Snakefile's container: directive. See the Snakefile header.
+container: "ghcr.io/benaroyaresearch/fm_2026:latest"
+
+# Shared R library holding the four SNPlocs/BSgenome reference data packages that
+# munge_sumstats.R loads. Roughly 13 GB, so they are kept out of the container image and
+# mounted from NFS instead. Must be built against the same R/Bioconductor as the image
+# (R 4.4 / Bioconductor 3.20) — the Dockerfile header has the one-time install command.
+# The path has to be visible inside job pods, so use one of the shares the Coder
+# Snakemake pods mount (/nfs, /juicefs, or a home directory).
+ref_lib: "/nfs/REPLACE_ME/fm_2026/R-4.4-bioc-3.20"
+
+use_functional_annotations: false # Should functional fine-mapping be implemented, if indicated
 finemap_thresholds:
   n_high: 100000 # Threshold for high sample size (one of the eligibility requirements for functional fine-mapping)
   snp_high: 2000000 # Threshold for high SNP count (one of the eligibility requirements for functional fine-mapping)
