@@ -3,6 +3,7 @@
 *.txt.gz
 *.txt
 *.tsv
+!study_table.tsv
 *.pdf
 
 # Snakemake internals
