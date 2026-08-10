@@ -1,0 +1,273 @@
+# One of two snakemakes involved in the FM pipeline. 
+# 
+# This Snakefile within pipeline_munge is used to automatically download and munge GWASs
+# within the config list. 
+# 
+# These steps have been kept separate from the true fine-mapping pipeline to help with debugging
+# and to provide a download/munging tool for future, potentially unrelated, analyses. 
+
+import pandas as pd
+import sys, os
+
+workdir: "../"
+
+# Adds shared folder (folder used for both pipelines) to Python's search path so Snakefile always
+# has access. 
+sys.path.insert(0, os.path.join(os.path.dirname(workflow.basedir), "shared"))
+from load_study_info import load_study_info
+
+# Filters study_table.tsv to studies listed in config_munge.yaml
+configfile: "config/config_munge.yaml"
+study_info = load_study_info(config)
+
+print(f"Running {len(study_info)} studies: {list(study_info.keys())}")
+
+# Pipeline ultimately needs to produce:
+#      1. fine-mapping decision file (both functional & regular, regular only, or none)
+#      2. file containing study trait
+rule all:
+    input:
+        expand("results/{study}/munged/{study}_fm_decision.txt", study=study_info.keys()),
+        expand("results/{study}/raw/{study}_trait.txt", study=study_info.keys())
+
+# Purpose: records the study's trait name as its own small file. 
+# Standalone. Only for record-keeping. 
+rule write_trait_file:
+    output:
+        "results/{study}/raw/{study}_trait.txt"
+    params:
+        trait = lambda wildcards: study_info[wildcards.study]["Trait"] # Look up trait
+    shell:
+        # Write trait to output file
+        r"""
+        echo "{params.trait}" > {output}
+        """
+
+# Purpose: determines the actual downloadable filename for a study's GWAS summary stats. 
+# Checks for harmonized version first, falling back to the main directory, then a last-resort
+# pattern match. 
+# Outputs text file with filename. 
+rule resolve_gwas_filename:
+    output:
+        "results/{study}/raw/{study}_filename.txt"
+    params:
+        dir_url = lambda wildcards: study_info[wildcards.study]["GWAS_dir_url"], # Gathers GWAS url
+        log_path = lambda wildcards: study_info[wildcards.study]["log_file"] # Gathers log file path
+    shell:
+        r"""
+        echo "$(date): checking for harmonised folder in {params.dir_url}" >> {params.log_path}
+
+        # Searches for a link to harmonised/ subfolder
+        HARM_CHECK=$(curl -s {params.dir_url}/ | grep -o 'href="harmonised/"') || true
+
+        # If harmonised subfolder found, looks for harmonised sumstats via ".h."
+        # If not, checks main directory for obvious sumstats file. 
+        if [ -n "$HARM_CHECK" ]; then
+            echo "$(date): harmonised folder found, looking inside" >> {params.log_path}
+            FNAME=$(curl -s {params.dir_url}/harmonised/ | grep -oP '(?<=href=")[^"]*\.h\.[^"]*' | head -1) || true
+            SUBFOLDER="harmonised/"
+        else
+            echo "$(date): no harmonised folder, checking main directory" >> {params.log_path}
+            FNAME=$(curl -s {params.dir_url}/ | grep -oP '(?<=href=")[^"]*\.sumstats\.tsv\.gz' | head -1) || true
+            SUBFOLDER=""
+        fi
+
+        # If no obvious sumstats file found, search for any filename containing the GCST ID and ending in .tsv.
+        if [ -z "$FNAME" ]; then
+            echo "$(date): WARNING: no obvious sumstats file found" >> {params.log_path}
+            FNAME=$(curl -s {params.dir_url}/ | grep -oP "(?<=href=\")[^\"]*{wildcards.study}[^\"]*\.tsv[^\"]*" | head -1) || true
+            SUBFOLDER=""
+        fi
+
+        # If all three attempts fail, record and end pipeline. 
+        if [ -z "$FNAME" ]; then
+            echo "$(date): no sumstats file found" >> {params.log_path}
+            exit 1
+        fi
+
+        echo "$SUBFOLDER$FNAME" > {output}
+        echo "$(date): resolved filename: $SUBFOLDER$FNAME" >> {params.log_path}
+        """
+
+# Purpose: download the GWAS from resolved file name. Ensures its a gzip-compressed regardless of GWAS catalog form. 
+# Skips if output already exists. 
+rule download_gwas:
+    input:
+        "results/{study}/raw/{study}_filename.txt"
+    output:
+        "results/{study}/raw/{study}_sumstats.tsv.gz"
+    params:
+        dir_url = lambda wildcards: study_info[wildcards.study]["GWAS_dir_url"],
+        log_path = lambda wildcards: study_info[wildcards.study]["log_file"]
+    shell:
+        r"""
+        # Checks if sumstats file already exists (manually placed there)
+        if [ -s {output} ]; then
+            echo "$(date): sumstats file already present at {output}, skipping download" >> {params.log_path}
+            exit 0
+        fi
+
+        # Concatenating full url
+        FNAME=$(cat {input})
+        FULL_URL="{params.dir_url}/$FNAME"
+
+        echo "$(date): downloading from $FULL_URL" >> {params.log_path}
+
+        # Temp download prevents failed/partial downloads from confusing Snakemake
+        TMP_DOWNLOAD=$(mktemp)
+        curl -# "$FULL_URL" -o "$TMP_DOWNLOAD"
+
+        # Checks that file is not empty.
+        if [ ! -s "$TMP_DOWNLOAD" ]; then
+            echo "STATUS: download not successful" >> {params.log_path}
+            rm -f "$TMP_DOWNLOAD"
+            exit 1
+        fi
+
+        # Checks if file has already been gzipped. If yes, move into place. If not, compress it. 
+        if file -b "$TMP_DOWNLOAD" | grep -qi "gzip"; then
+            mv "$TMP_DOWNLOAD" {output}
+        else
+            gzip -c "$TMP_DOWNLOAD" > {output}
+            rm -f "$TMP_DOWNLOAD"
+        fi
+
+        echo "STATUS: downloaded successfully" >> {params.log_path}
+        """
+
+# Purpose: QC gate deciding whether a downloaded file has the minimum columns and SNP density to 
+# be worth munging. 
+rule check_gwas_coverage:
+    input:
+        "results/{study}/raw/{study}_sumstats.tsv.gz"
+    output:
+        "results/{study}/raw/{study}_coverage_check.txt"
+    params:
+        log_path = lambda wildcards: study_info[wildcards.study]["log_file"]
+    shell:
+        r"""
+        # Decompresses to a temp file to check header. Fix for previous bug: piping a live scat into a head
+        # caused pipeline to die mid-stream.
+        TMP_FILE=$(mktemp)
+        zcat {input} > "$TMP_FILE"
+
+        # Gather the header and SNP count
+        HEADER=$(head -1 "$TMP_FILE")
+        SNP_COUNT=$(tail -n +2 "$TMP_FILE" | wc -l)
+
+        # Always record header and SNP count, regardless of pass/fail outcome below.
+        echo "$(date): coverage check — header: $HEADER" >> {params.log_path}
+        echo "$(date): coverage check — snp_count: $SNP_COUNT" >> {params.log_path}
+
+        # Possible names for required columns
+        POSITION_COLS="hm_chrom hm_pos CHR BP chr_name chr_position chromosome base_pair_location"
+        EFFECT_COLS="hm_beta BETA hm_odds_ratio OR beta odds_ratio"
+        SE_COLS="standard_error SE hm_ci_lower"
+        ZSCORE_COLS="Z Z_SCORE z_score ZSCORE"
+        PVAL_COLS="p_value PVAL P"
+
+        # Function that checks the header against a list of acceptable column-name variants per category
+        # (position, effect size, standard error, Z-score, p-value)
+        has_match() {{
+            local candidates="$1"
+            for col in $candidates; do
+                if echo "$HEADER" | grep -qw "$col"; then
+                    echo "$col"
+                    return 0
+                fi
+            done
+            return 1
+        }}
+
+        pos_found=$(has_match "$POSITION_COLS") || true
+        effect_found=$(has_match "$EFFECT_COLS") || true
+        se_found=$(has_match "$SE_COLS") || true
+        z_found=$(has_match "$ZSCORE_COLS") || true
+        pval_found=$(has_match "$PVAL_COLS") || true
+
+        # Either direct z-column or effect size + standard error are sufficient (matches what SuSiE needs)
+        if [ -n "$z_found" ]; then
+            signal_ok="yes"
+        elif [ -n "$effect_found" ] && [ -n "$se_found" ]; then
+            signal_ok="yes"
+        else
+            signal_ok="no"
+        fi
+
+        rm -f "$TMP_FILE"
+
+        echo "$(date): coverage check — position=$pos_found signal=$signal_ok pval=$pval_found snp_count=$SNP_COUNT" >> {params.log_path}
+
+        # If position data is missing, signal data is insufficient. If SNP count is below 1,000,000 (designating in config file), signal
+        # data is insufficient. 
+        if [ -z "$pos_found" ] || [ "$signal_ok" = "no" ] || [ "$SNP_COUNT" -lt 1000000 ]; then
+            echo "FAIL: coverage check failed. Sumstats file kept for manual review at results/{wildcards.study}/raw/{wildcards.study}_sumstats.tsv.gz" >> {params.log_path}
+            exit 1
+        fi
+
+        # Flag oversized studies for memory planning and exit. Don't proceed to munge
+        if [ "$SNP_COUNT" -gt 13000000 ]; then
+            echo "$(date): FLAG: Study has over 13,000,000 SNPs. Adjust session memory requirements." >> {params.log_path}
+            exit 1
+        fi
+
+        echo "PASS" > {output}
+        """
+
+# Purpose: munge GWAS to clean for downstream fine-mapping
+rule munge_gwas:
+    input:
+        sumstats = "results/{study}/raw/{study}_sumstats.tsv.gz",
+        coverage_check = "results/{study}/raw/{study}_coverage_check.txt",
+        file_name = "results/{study}/raw/{study}_filename.txt"
+    output:
+        munged = "results/{study}/munged/{study}_munged.tsv.gz",
+        decision = "results/{study}/munged/{study}_fm_decision.txt"
+    threads: 4
+    # resources:
+    #     mem_mb = 32000
+
+    # Required for shell/munging
+    params:
+        log_path = lambda wildcards: study_info[wildcards.study]["log_file"],
+        n = lambda wildcards: study_info[wildcards.study]["n"],
+        n_high = config["finemap_thresholds"]["n_high"],
+        snp_high = config["finemap_thresholds"]["snp_high"],
+        n_mid_low = config["finemap_thresholds"]["n_mid_low"],
+        snp_mid_low = config["finemap_thresholds"]["snp_mid_low"],
+        timeout_h = config["munge_timeout_hours"]
+    shell:
+        r"""
+
+        # Recheck that the coverage file actually says pass before continuing to munge
+        # (Edge case where log could claim success but coverage file itself might not)
+        if ! grep -q "^PASS$" {input.coverage_check}; then
+            echo "$(date): ERROR - coverage check did not pass, refusing to munge" >> {params.log_path}
+            exit 1
+        fi
+
+        FNAME=$(cat {input.file_name})
+
+        # Runs munge script
+        # Keeping shell errors (e.g. OOT, OOM) separate from R errors.
+        # Designates time munge time limit 
+        set +e # Allows exit code from Rscropt to be captured and inspected 
+        timeout {params.timeout_h}h Rscript pipeline_munge/scripts/munge_sumstats.R \
+            {input.sumstats} {output.munged} {output.decision} {params.log_path} \
+            {threads} {params.n} {params.n_high} {params.snp_high} \
+            {params.n_mid_low} {params.snp_mid_low} "$FNAME"
+        EXIT_CODE=$?
+        set -e
+
+        # Distinguishes between timeout, out-of-memory kill, and any other failure by exit code
+        if [ $EXIT_CODE -eq 124 ]; then
+            echo "$(date): ERROR - munge exceeded {params.timeout_h}h time limit (OOT)" >> {params.log_path}
+            exit 1
+        elif [ $EXIT_CODE -eq 137 ]; then
+            echo "$(date): ERROR - munge process killed, likely OOM" >> {params.log_path}
+            exit 1
+        elif [ $EXIT_CODE -ne 0 ]; then
+            echo "$(date): munge exited with code $EXIT_CODE — see prior log lines for R-level error detail" >> {params.log_path}
+            exit 1
+        fi
+        """

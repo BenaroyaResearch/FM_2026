@@ -1,0 +1,40 @@
+studies:
+- "GCST90824163"
+# - "GCST90472771"
+# - "GCST004131"
+# - "GCST90624742"
+# - "GCST90652532"
+# - "GCST90624741"
+# - "GCST90468120"
+# - "GCST90468147"
+locus_window_bp: 500000
+thousand_genomes_plink_prefix: "/home/gdenonno/fine_mapping/1000_genome_files/1000g_hg38_plink/EUR/1000g_hg38_EUR_chr"  # fill in real path/naming
+thousand_genomes_sample_dir: "/home/gdenonno/fine_mapping/1000_genome_files"        # {Ancestry}.1000g.sample.ID.txt
+ld_r2_threshold: 0.6
+ld_window_kb: 500
+#susie_z_ld_weight: 0.1
+susie_max_causal: 10
+lambda_warn_threshold: 0.1
+lambda_fail_threshold: 0.3
+lead_variant_table: "config/07272026_library_leadVariantTable.csv"
+opentargets_raw_table: "/home/gdenonno/FM_2026/FM_checking/credible_set_merged_25.03.tsv.gz"
+opentargets_cs_size_exclude_threshold: 50
+confidence_scoring:
+  pip_disqualify_threshold: 1.00
+
+  ld_missing_high_weight: 15   # penalty per missing neighbor with R2 >= 0.8
+  ld_missing_low_weight: 7     # penalty per missing neighbor with R2 0.6-0.8
+
+  qc_failed_rate_weight: 100   # multiplied by qc_failed_rate (0-1 fraction)
+
+  lambda_ok_threshold: 0.1
+  lambda_scale: 100
+  lambda_max_penalty: 40
+
+  cs_count_weight_2: 8
+  cs_count_weight_3: 18
+  cs_count_weight_4plus: 30
+
+  cs_size_ok_threshold: 5
+  cs_size_scale: 0.3
+  cs_size_max_penalty: 35

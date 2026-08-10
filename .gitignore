@@ -1,0 +1,30 @@
+# Data
+*.tsv.gz
+*.txt.gz
+*.txt
+*.tsv
+*.pdf
+
+# Snakemake internals
+.snakemake/
+FM_checking/
+pipeline_finemap/
+results/
+logs/
+
+# R
+.Rhistory
+.RData
+check_lambda.R
+count_associations.R
+
+# Environment
+*.conda
+
+# Python
+add_study.py
+find_missing_GWASs.py
+
+# md and qmd
+*.md
+*.qmd
