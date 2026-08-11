@@ -166,7 +166,12 @@ cmd_status() {
         info "RUNNING  pid $pid  (started $(ps -o lstart= -p "$pid" | sed 's/^ *//'))"
     else
         info "NOT RUNNING"
-        [[ -f "$PID_FILE" ]] && info "  (stale pid file $PID_FILE)"
+        # A pid file with no live snakemake behind it is left over from a finished or killed
+        # run. Prune it so status stays quiet, rather than reporting it after every run.
+        if [[ -f "$PID_FILE" ]]; then
+            info "  (previous run has ended; clearing $PID_FILE)"
+            rm -f "$PID_FILE"
+        fi
     fi
 
     if [[ -e "$LATEST_LOG" ]]; then
