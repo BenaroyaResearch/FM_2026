@@ -17,29 +17,30 @@ The library **must be built against R 4.4 / Bioconductor 3.20**, matching the im
 built by a newer R minor version, so a mismatch is a guaranteed failure — and it surfaces
 hours in, at the end of a long munge, not at launch.
 
-Run once per checkout, from the project root:
+Run `setup_renv.sh` once per checkout, from the project root:
 
 ```bash
-# 1. Confirm R is 4.4.x. If it is not, switch R before going further.
-R --version                      # expect: R version 4.4.2
-
-# 2. Point renv at the shared package cache. Without this, restore compiles ~13 GB from
-#    source; with it, packages are symlinked out of the cache in minutes. The workspace
-#    image normally sets this already.
-export RENV_PATHS_CACHE=/renv
-
-# 3. Restore. .Rprofile bootstraps renv automatically, so no install step is needed.
-R -e 'renv::restore(prompt = FALSE)'
+./setup_renv.sh            # restore the library, then verify it
+./setup_renv.sh check      # verify an existing setup, changes nothing
 ```
 
-Then verify the four data packages actually landed — this is exactly what `munge_gwas`
-pre-flight checks before it starts:
+It checks that R matches the image before doing any work, restores the library, then
+verifies the result and exits non-zero if anything is wrong. Both modes are safe to re-run.
+`renv::restore()` output is logged to `logs/renv_setup_<timestamp>.log`.
 
-```bash
-ls -d renv/library/*/*/*/{SNPlocs.Hsapiens.dbSNP155.GRCh38,SNPlocs.Hsapiens.dbSNP155.GRCh37,BSgenome.Hsapiens.NCBI.GRCh38,BSgenome.Hsapiens.1000genomes.hs37d5}
+A healthy `check` looks like:
+
+```
+  ok    R 4.4 matches the image (R 4.4), Bioconductor 3.20
+Verifying reference library:
+  ok    single library: /home/<you>/FM_2026/renv/library/linux-ubuntu-noble/R-4.4/x86_64-pc-linux-gnu
+  ok    SNPlocs.Hsapiens.dbSNP155.GRCh38
+  ok    SNPlocs.Hsapiens.dbSNP155.GRCh37
+  ok    BSgenome.Hsapiens.NCBI.GRCh38
+  ok    BSgenome.Hsapiens.1000genomes.hs37d5
 ```
 
-And confirm the Snakefile discovers it, which prints the resolved absolute path:
+Then confirm the Snakefile discovers the same path:
 
 ```bash
 ./run_munge.sh dryrun | head -2
@@ -47,17 +48,30 @@ And confirm the Snakefile discovers it, which prints the resolved absolute path:
 # Reference package library: /home/<you>/FM_2026/renv/library/linux-ubuntu-noble/R-4.4/x86_64-pc-linux-gnu
 ```
 
-Things that go wrong here:
+#### What it does, and what it catches
 
-- **"no reference package library found"** — `renv::restore()` has not been run, or it was
-  run from somewhere other than the project root.
-- **"multiple renv libraries found"** — more than one directory matches
-  `renv/library/*/*/*`, usually left over from an R upgrade. Delete the stale one, or name
-  the right one via `ref_lib:` in `config/config_munge.yaml`.
-- **A warning that the library is `R-4.3` (or similar) but the image ships `R-4.4`** — the
-  library was built under the wrong R. Rebuild it under R 4.4.
-- **Dangling symlinks.** renv library entries point into the shared `/renv` cache, so job
-  pods must mount both the project directory and `/renv`. The `coder` profile does both.
+The manual equivalent is three steps — confirm R is 4.4.x, point `RENV_PATHS_CACHE` at the
+shared cache (without it, restore compiles ~13 GB from source instead of symlinking out of
+the cache in minutes), then `R -e 'renv::restore(prompt = FALSE)'` from the project root,
+where `.Rprofile` bootstraps renv automatically.
+
+The value is in the checks around that, each of which otherwise surfaces hours into a munge
+rather than at setup time:
+
+- **Wrong R.** Refuses to restore at all if R's major.minor does not match the image, since
+  R will not load packages built under a different R minor version. The expected version is
+  read out of `CONTAINER_R_VERSION` in the Snakefile, so the script cannot drift from what
+  the Snakefile checks against.
+- **No library** — `renv::restore()` never ran, or ran outside the project root.
+- **Multiple libraries** matching `renv/library/*/*/*`, usually left over from an R upgrade.
+  `resolve_ref_lib()` in the Snakefile refuses to guess between them, so this is fatal;
+  delete the stale one or name the right one via `ref_lib:` in `config/config_munge.yaml`.
+- **A library keyed to the wrong R**, e.g. `R-4.3` when the image ships `R-4.4`. The
+  Snakefile only warns about this; the script treats it as a failure.
+- **Dangling symlinks.** Library entries point into the shared `/renv` cache, so job pods
+  must mount both the project directory and `/renv` — the `coder` profile does both. These
+  are reported as dangling rather than merely missing, because an unmounted cache and a
+  never-installed package need completely different fixes.
 
 To use a standalone BiocManager library instead of renv, see the install command in the
 Dockerfile header and set `ref_lib:` in `config/config_munge.yaml` (or pass
@@ -73,8 +87,9 @@ Note: keep credentials such as `GITHUB_PAT` in `~/.Renviron`, never in a project
 gives you a clean way to stop it. Runs are long — tens of minutes per GWAS download, up to
 `munge_timeout_hours` per munge — so they need to survive the terminal closing.
 
-Before launching: list the GCST IDs you want in `studies:` in `config/config_munge.yaml`,
-and make sure each one has a row in `config/study_table.tsv`.
+Before launching: run `./setup_renv.sh` once (above), list the GCST IDs you want in
+`studies:` in `config/config_munge.yaml`, and make sure each one has a row in
+`config/study_table.tsv`.
 
 ```bash
 conda activate snakemake          # or: export SNAKEMAKE=/path/to/bin/snakemake
