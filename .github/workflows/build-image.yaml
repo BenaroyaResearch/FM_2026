@@ -10,7 +10,11 @@
 #
 #   pull request      -> pr-<number>-<short sha>   (built only, not pushed)
 #   push to main      -> latest, main-<short sha>
-#   release published -> the release tag (e.g. v1.0.1), plus latest
+#   release published -> the release tag (e.g. v1.0.1)
+#
+# Releases do not also move :latest. Every release is cut from main, which already
+# published :latest for that commit, so re-tagging here would only add a way for the two
+# to disagree.
 #
 # Pin config/config_munge.yaml at an immutable tag (a release tag or main-<sha>) rather
 # than :latest, so a rerun months from now uses the same MungeSumstats that produced the
@@ -79,9 +83,13 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # type=sha takes no event= attribute (that is type=ref only), so it must be
+          # gated with enable= instead. Gating on is_default_branch also guarantees
+          # {{branch}} is non-empty — on a pull_request it expands to nothing, which
+          # produced the invalid tag ":-<sha>".
           tags: |
             type=ref,event=pr,prefix=pr-,suffix=-{{sha}}
-            type=sha,event=branch,prefix={{branch}}-
+            type=sha,prefix={{branch}}-,enable={{is_default_branch}}
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=tag
           labels: |
