@@ -1,5 +1,166 @@
 # 2026 FM Pipeline Documentation
 
+Sections 1-4 below document how the pipeline works, stage by stage. The two sections
+immediately following are the practical "how do I run this" instructions: set up the R
+reference library once, then launch with `run_munge.sh`.
+
+
+## Setup: R reference library (renv)
+
+`munge_sumstats.R` needs four SNPlocs/BSgenome reference data packages. They come to
+roughly 13 GB, which is too large to ship inside the container image, so they live in the
+project's renv library and are mounted into the job pods instead. The container carries
+MungeSumstats; the renv library carries the reference data. Both are needed.
+
+The library **must be built against R 4.4 / Bioconductor 3.20**, matching the image
+(`bioconductor/bioconductor_docker:RELEASE_3_20`, R 4.4.2). R refuses to load packages
+built by a newer R minor version, so a mismatch is a guaranteed failure — and it surfaces
+hours in, at the end of a long munge, not at launch.
+
+Run `setup_renv.sh` once per checkout, from the project root:
+
+```bash
+./setup_renv.sh            # restore the library, then verify it
+./setup_renv.sh check      # verify an existing setup, changes nothing
+```
+
+It checks that R matches the image before doing any work, restores the library, then
+verifies the result and exits non-zero if anything is wrong. Both modes are safe to re-run.
+`renv::restore()` output is logged to `logs/renv_setup_<timestamp>.log`.
+
+A healthy `check` looks like:
+
+```
+  ok    R 4.4 matches the image (R 4.4), Bioconductor 3.20
+Verifying reference library:
+  ok    single library: /home/<you>/FM_2026/renv/library/linux-ubuntu-noble/R-4.4/x86_64-pc-linux-gnu
+  ok    SNPlocs.Hsapiens.dbSNP155.GRCh38
+  ok    SNPlocs.Hsapiens.dbSNP155.GRCh37
+  ok    BSgenome.Hsapiens.NCBI.GRCh38
+  ok    BSgenome.Hsapiens.1000genomes.hs37d5
+```
+
+Then confirm the Snakefile discovers the same path:
+
+```bash
+./run_munge.sh dryrun | head -2
+# Running 1 studies: ['GCST90132226']
+# Reference package library: /home/<you>/FM_2026/renv/library/linux-ubuntu-noble/R-4.4/x86_64-pc-linux-gnu
+```
+
+#### What it does, and what it catches
+
+The manual equivalent is three steps — confirm R is 4.4.x, point `RENV_PATHS_CACHE` at the
+shared cache (without it, restore compiles ~13 GB from source instead of symlinking out of
+the cache in minutes), then `R -e 'renv::restore(prompt = FALSE)'` from the project root,
+where `.Rprofile` bootstraps renv automatically.
+
+The value is in the checks around that, each of which otherwise surfaces hours into a munge
+rather than at setup time:
+
+- **Wrong R.** Refuses to restore at all if R's major.minor does not match the image, since
+  R will not load packages built under a different R minor version. The expected version is
+  read out of `CONTAINER_R_VERSION` in the Snakefile, so the script cannot drift from what
+  the Snakefile checks against.
+- **No library** — `renv::restore()` never ran, or ran outside the project root.
+- **Multiple libraries** matching `renv/library/*/*/*`, usually left over from an R upgrade.
+  `resolve_ref_lib()` in the Snakefile refuses to guess between them, so this is fatal;
+  delete the stale one or name the right one via `ref_lib:` in `config/config_munge.yaml`.
+- **A library keyed to the wrong R**, e.g. `R-4.3` when the image ships `R-4.4`. The
+  Snakefile only warns about this; the script treats it as a failure.
+- **Dangling symlinks.** Library entries point into the shared `/renv` cache, so job pods
+  must mount both the project directory and `/renv` — the `coder` profile does both. These
+  are reported as dangling rather than merely missing, because an unmounted cache and a
+  never-installed package need completely different fixes.
+
+To use a standalone BiocManager library instead of renv, see the install command in the
+Dockerfile header and set `ref_lib:` in `config/config_munge.yaml` (or pass
+`--config ref_lib=/path`).
+
+Note: keep credentials such as `GITHUB_PAT` in `~/.Renviron`, never in a project-level
+`.Renviron` — the latter sits inside the repo and gets committed.
+
+
+## Running: run_munge.sh
+
+`run_munge.sh` at the project root launches the munge pipeline detached under `nohup` and
+gives you a clean way to stop it. Runs are long — tens of minutes per GWAS download, up to
+`munge_timeout_hours` per munge — so they need to survive the terminal closing.
+
+Before launching: run `./setup_renv.sh` once (above), list the GCST IDs you want in
+`studies:` in `config/config_munge.yaml`, and make sure each one has a row in
+`config/study_table.tsv`.
+
+```bash
+conda activate snakemake          # or: export SNAKEMAKE=/path/to/bin/snakemake
+
+./run_munge.sh dryrun             # check the DAG and library discovery, creates no pods
+./run_munge.sh start              # launch detached
+./run_munge.sh log                # follow the live log
+./run_munge.sh status             # alive? last log lines? which k8s jobs?
+./run_munge.sh cancel             # graceful stop
+```
+
+Results land in `results/{study}/` inside the project directory, and each study's log at
+`results/{study}/{study}.log`. The driver's own log goes to `logs/munge_<timestamp>.log`,
+with `logs/munge_latest.log` symlinked to the newest.
+
+Extra arguments are passed straight through to snakemake, so anything not covered by the
+wrapper still works:
+
+```bash
+./run_munge.sh start --rerun-incomplete
+./run_munge.sh start --config munge_mem_mb_schedule="[65536, 131072]"
+./run_munge.sh dryrun --config ref_lib=/tmp      # skip the library check entirely
+```
+
+Environment overrides: `SNAKEMAKE` (binary path), `PROFILE` (default `coder`), `JOBS`
+(default 4), `IMAGE` (default: the `container:` key in `config/config_munge.yaml`).
+
+#### What the wrapper sets for you
+
+- `--container-image`, read back out of `config/config_munge.yaml`. The Kubernetes executor
+  ignores the Snakefile's `container:` directive and needs the image named on the command
+  line, so reading the same config key keeps the two from drifting.
+- `--default-resources tmpdir=<project>/.tmp`, keeping `check_gwas_coverage`'s full
+  decompression of the GWAS on shared storage instead of filling the pod's ephemeral disk.
+- Baseline `mem_mb`/`disk_mb` for the small rules. `munge_gwas` is deliberately left alone
+  so it uses the escalating schedule declared in the Snakefile — see below.
+
+#### Cancelling
+
+`cancel` sends **SIGINT**, which snakemake traps: it cancels the Kubernetes jobs it
+submitted and releases the `.snakemake` lock on the way out. It escalates to SIGTERM then
+SIGKILL only if the driver is still alive after 120s, and in that case jobs may be
+orphaned. `cancel --force` additionally deletes any leftover `snakejob-*` jobs — opt-in
+because the name pattern cannot tell your jobs apart from a concurrent run's.
+
+If a run is killed rather than interrupted, the next `start` may fail on a stale lock.
+Clear it with `./run_munge.sh unlock`.
+
+Listing and sweeping Kubernetes jobs needs `kubectl` on PATH; the wrapper says so
+explicitly when it is missing rather than silently reporting nothing to clean.
+
+#### munge_gwas memory
+
+`munge_gwas` requests 64 GB on its first attempt and escalates on retry — 64, then 96, then
+128 GB — via a `mem_mb` callable keyed to snakemake's `attempt` counter, with `retries: 2`
+declared on the rule. Retrying is cheap because `download_gwas` skips a download that is
+already on disk, so a retry re-runs only the munge.
+
+Tune the schedule without editing the Snakefile:
+
+```bash
+./run_munge.sh start --config munge_mem_mb_schedule="[65536, 131072, 196608]"
+```
+
+Two caveats. On Kubernetes `mem_mb` is both the pod's memory request *and* its limit, so an
+entry larger than any node's allocatable memory leaves the pod `Pending` indefinitely
+rather than failing fast — keep the top entry under what a node can actually satisfy. And
+`retries` applies to every failure of the rule, not just OOM kills: the pre-flight checks
+fail in seconds so retrying them is cheap, but a run that hits the `munge_timeout_hours`
+limit is retried too. Set `retries: 0` on the rule to disable escalation.
+
 
 ## 1: Build study table
 
