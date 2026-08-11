@@ -12,10 +12,13 @@
 #
 # This image instead starts from the same R/Bioconductor foundation the official image
 # is built on — bioconductor/bioconductor_docker RELEASE_3_20 (R 4.4.2, Bioconductor
-# 3.20, Ubuntu 22.04 "jammy") — and installs MungeSumstats from that frozen Bioconductor
-# release. So MungeSumstats resolves to the same version the official container ships;
-# only the multi-GB reference data is left out. That data lives in a shared R library on
-# NFS instead (see "Reference data" below), which keeps this image around 2-3 GB.
+# 3.20, Ubuntu 24.04 "noble") — and installs MungeSumstats from that frozen Bioconductor
+# release. So MungeSumstats resolves to the same version the official container ships
+# (1.14.1); only the multi-GB reference data is left out. That data lives in a shared R
+# library instead (see "Reference data" below), keeping this image under 2 GB.
+#
+# noble / R 4.4 / x86_64-pc-linux-gnu also matches the platform triple renv keys its
+# global cache by, so a library built by renv in a Coder workspace is loadable here.
 #
 # ---------------------------------------------------------------------------
 # Why Snakemake is installed here
@@ -26,8 +29,10 @@
 # flag is snakemake/snakemake:v<version>). The pod therefore re-parses the Snakefile,
 # which imports pandas at module scope, so both Snakemake and pandas must be present.
 #
-# Snakemake 8+ requires Python >= 3.11 and jammy ships 3.10, so uv provides a managed
-# 3.12 rather than pulling in a PPA. SNAKEMAKE_VERSION must match the driver running in
+# Snakemake 8+ requires Python >= 3.11. Noble's system Python 3.12 would qualify, but it
+# is PEP 668 "externally managed", so uv installs Snakemake into its own environment
+# instead of forcing --break-system-packages onto the system interpreter.
+# SNAKEMAKE_VERSION must match the driver running in
 # the Coder workspace (`conda activate snakemake; snakemake --version`) — a mismatched
 # pod version is the usual cause of jobs failing immediately with argument errors.
 #
