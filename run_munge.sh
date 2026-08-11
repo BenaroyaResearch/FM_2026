@@ -16,13 +16,22 @@
 #   ./run_munge.sh unlock                            release a stale .snakemake lock
 #
 # Environment overrides:
-#   SNAKEMAKE   path to the snakemake binary   (default: first on PATH)
-#   PROFILE     snakemake profile name         (default: coder)
-#   JOBS        concurrent jobs                (default: 4)
-#   IMAGE       container image                (default: the container: key in
-#                                               config/config_munge.yaml, so the flag the
-#                                               k8s executor needs cannot drift from the
-#                                               directive the Snakefile declares)
+#   SNAKEMAKE      path to the snakemake binary   (default: first on PATH)
+#   PROFILE        snakemake profile name         (default: coder)
+#   IMAGE          container image                (default: the container: key in
+#                                                  config/config_munge.yaml, so the flag the
+#                                                  k8s executor needs cannot drift from the
+#                                                  directive the Snakefile declares)
+#
+# Concurrency caps:
+#   JOBS           jobs in flight overall         (default: 4)
+#   MAX_JOBS       hard ceiling on JOBS           (default: 8)
+#   MAX_DOWNLOADS  simultaneous GWAS downloads    (default: 2)
+#   MAX_MUNGES     simultaneous munges            (default: 2)
+#
+# The per-rule caps exist because --jobs cannot express them: every munge asks for 64 GB,
+# and every download is a multi-GB pull from the same EBI FTP server. The effective limit
+# for a rule is the smaller of its own cap and JOBS.
 
 set -euo pipefail
 
@@ -37,10 +46,55 @@ PID_FILE="$LOG_DIR/munge.pid"
 LATEST_LOG="$LOG_DIR/munge_latest.log"
 
 PROFILE="${PROFILE:-coder}"
+
+# Concurrency caps.
+#
+# JOBS is snakemake's --jobs: the ceiling on jobs in flight overall. MAX_JOBS is a hard
+# ceiling on JOBS itself, so a typo or an optimistic setting cannot flood the cluster with
+# pods — every job here is a multi-GB download or a 64 GB munge, not a cheap task.
+#
+# The two per-rule caps are what usually matter more, since --jobs alone cannot express
+# them. They are enforced by the driver's scheduler via --resources, so they apply on any
+# executor. Snakemake takes the effective limit as the minimum of these and JOBS.
 JOBS="${JOBS:-4}"
+MAX_JOBS="${MAX_JOBS:-8}"
+MAX_DOWNLOADS="${MAX_DOWNLOADS:-2}"   # simultaneous EBI FTP pulls
+MAX_MUNGES="${MAX_MUNGES:-2}"         # simultaneous munges, i.e. 2 x munge_gwas mem_mb
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 info() { printf '%s\n' "$*"; }
+
+# --- concurrency caps ------------------------------------------------------
+
+require_count() {
+    local name=$1 val=$2
+    [[ "$val" =~ ^[1-9][0-9]*$ ]] \
+        || die "$name must be a positive integer, got '$val'"
+}
+
+# Validated and clamped before any pods are created, so an over-large JOBS is corrected
+# rather than silently honoured.
+apply_caps() {
+    require_count MAX_JOBS "$MAX_JOBS"
+    require_count JOBS "$JOBS"
+    require_count MAX_DOWNLOADS "$MAX_DOWNLOADS"
+    require_count MAX_MUNGES "$MAX_MUNGES"
+
+    if (( JOBS > MAX_JOBS )); then
+        info "note: JOBS=$JOBS exceeds the MAX_JOBS=$MAX_JOBS cap; using $MAX_JOBS."
+        info "      Raise the cap with MAX_JOBS=<n> if that is really what you want."
+        JOBS=$MAX_JOBS
+    fi
+
+    # Nothing breaks if a per-rule cap exceeds JOBS — snakemake takes the minimum — but
+    # saying so avoids the impression that a higher number is in effect.
+    if (( MAX_DOWNLOADS > JOBS )); then
+        info "note: MAX_DOWNLOADS=$MAX_DOWNLOADS is above JOBS=$JOBS, so JOBS is the real limit."
+    fi
+    if (( MAX_MUNGES > JOBS )); then
+        info "note: MAX_MUNGES=$MAX_MUNGES is above JOBS=$JOBS, so JOBS is the real limit."
+    fi
+}
 
 # --- discovery -------------------------------------------------------------
 
@@ -111,6 +165,7 @@ common_args() {
         --profile "$PROFILE" \
         --jobs "$JOBS" \
         --keep-going \
+        --resources "downloads=$MAX_DOWNLOADS" "munge_slots=$MAX_MUNGES" \
         --default-resources "tmpdir='$TMP_DIR'" mem_mb=4000 disk_mb=20000
 }
 
@@ -122,6 +177,7 @@ cmd_start() {
         die "a run is already active (pid $pid). Use '$0 cancel' first, or '$0 log' to watch it."
     fi
 
+    apply_caps
     snakemake_bin=$(find_snakemake)
     image=$(find_image)
     mkdir -p "$LOG_DIR" "$TMP_DIR"
@@ -135,7 +191,8 @@ cmd_start() {
 
     info "snakemake:  $snakemake_bin"
     info "image:      $image"
-    info "profile:    $PROFILE (jobs=$JOBS)"
+    info "profile:    $PROFILE"
+    info "concurrency: $JOBS jobs (cap $MAX_JOBS), $MAX_DOWNLOADS downloads, $MAX_MUNGES munges"
     info "tmpdir:     $TMP_DIR"
     info "log:        $log"
 
@@ -151,6 +208,7 @@ cmd_start() {
 
 cmd_dryrun() {
     local snakemake_bin
+    apply_caps
     snakemake_bin=$(find_snakemake)
     mkdir -p "$TMP_DIR"
     local -a args
@@ -266,7 +324,7 @@ cmd_unlock() {
 }
 
 usage() {
-    sed -n '3,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '3,34p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 case "${1:-}" in
