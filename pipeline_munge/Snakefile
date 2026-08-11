@@ -7,7 +7,7 @@
 # and to provide a download/munging tool for future, potentially unrelated, analyses. 
 
 import pandas as pd
-import sys, os
+import sys, os, glob, re
 
 workdir: "../"
 
@@ -21,6 +21,126 @@ configfile: "config/config_munge.yaml"
 study_info = load_study_info(config)
 
 print(f"Running {len(study_info)} studies: {list(study_info.keys())}")
+
+# ---------------------------------------------------------------------------
+# Containerization
+# ---------------------------------------------------------------------------
+# Every rule runs inside the image built from the Dockerfile at the repo root and
+# published to ghcr.io/benaroyaresearch/fm_2026. It carries curl, file, gzip and GNU grep
+# (with PCRE) for the shell rules, and R with MungeSumstats for munge_gwas. The
+# SNPlocs/BSgenome reference data is deliberately not in the image — see config["ref_lib"]
+# below.
+#
+# How the image actually gets applied depends on the executor, and the two paths are not
+# interchangeable:
+#
+#   Kubernetes (how this is deployed, per the Coder workspace docs)
+#       The k8s executor plugin ignores the `container:` directive below. It puts a
+#       single image on every job pod, taken from --container-image, and runs Snakemake
+#       inside that pod to execute the rule. So the image must be named on the command
+#       line as well:
+#
+#           conda activate snakemake
+#           snakemake --profile coder --jobs <n> \
+#                     --container-image ghcr.io/benaroyaresearch/fm_2026:<tag> \
+#                     --latency-wait 120 --keep-going --default-resources
+#
+#       Because the pod re-parses this Snakefile, the image needs Snakemake and pandas
+#       too — the Dockerfile installs both. Drop --use-conda: no rule here declares a
+#       conda env, and dependencies come from the image instead.
+#
+#   Local / Apptainer
+#       `container:` below is the directive Apptainer honors, so a local run works with
+#       --software-deployment-method apptainer and no extra flags. Note that Apptainer
+#       bind-mounts little beyond the working directory, so if $TMPDIR points at scratch,
+#       add --apptainer-args "--bind $TMPDIR" — download_gwas and check_gwas_coverage
+#       stage multi-GB temp files there, and the coverage check decompresses the whole
+#       GWAS.
+#
+# Do not combine `container:` with --sdm apptainer while on the Kubernetes executor. That
+# combination asks for Apptainer nested inside the pod, which makes the plugin request
+# privileged pods, and its own source notes that path does not currently work.
+#
+# Both paths read the same config key, so the declared image and the flag cannot drift.
+if "container" not in config:
+    sys.exit(
+        "ERROR: config/config_munge.yaml is missing the 'container' key.\n"
+        "Set it to the published image, e.g. ghcr.io/benaroyaresearch/fm_2026:v1.0.0"
+    )
+
+container: config["container"]
+
+# ---------------------------------------------------------------------------
+# Reference data library
+# ---------------------------------------------------------------------------
+# munge_sumstats.R needs the SNPlocs/BSgenome data packages, which are too large to ship
+# in the image. Rather than commit a machine-specific path, the renv project library is
+# discovered here, on the driver, where the project sits at its real absolute path.
+#
+# It has to be absolute: the k8s executor gives each pod an emptyDir at /workdir, so a
+# relative path resolves against scratch space rather than the project. Absolute paths
+# that work in the Coder workspace resolve identically inside job pods.
+#
+# Set ref_lib in the config (or --config ref_lib=/path) to override, which is what a
+# standalone BiocManager library needs.
+#
+# The library is layered on top of the image's own packages via R_LIBS rather than
+# replacing them. That is why the image sets RENV_CONFIG_AUTOLOADER_ENABLED=FALSE: the
+# project's renv .Rprofile would otherwise take over .libPaths() inside every pod and hide
+# the image's MungeSumstats. See the Dockerfile for the full reasoning.
+
+# Path component renv uses for the R version, which must match the image's R. Update
+# this alongside the Bioconductor release in the Dockerfile.
+CONTAINER_R_VERSION = "R-4.4"
+
+
+def resolve_ref_lib(config):
+    explicit = config.get("ref_lib")
+    if explicit:
+        return os.path.abspath(os.path.expanduser(explicit))
+
+    # renv lays out <project>/renv/library/<platform>/<R-version>/<arch>
+    found = sorted(p for p in glob.glob("renv/library/*/*/*") if os.path.isdir(p))
+
+    if not found:
+        sys.exit(
+            "ERROR: no reference package library found.\n"
+            "Expected an renv library at renv/library/<platform>/<R-version>/<arch> "
+            f"under {os.getcwd()}.\n"
+            "Run renv::restore() from the project root, or set 'ref_lib' in "
+            "config/config_munge.yaml to a standalone library.\n"
+            "To run the non-munge rules without a library present, pass "
+            "--config ref_lib=/tmp."
+        )
+
+    if len(found) > 1:
+        sys.exit(
+            "ERROR: multiple renv libraries found, cannot pick one automatically:\n  "
+            + "\n  ".join(found)
+            + "\nSet 'ref_lib' in config/config_munge.yaml to the correct one."
+        )
+
+    return os.path.abspath(found[0])
+
+
+ref_lib = resolve_ref_lib(config)
+print(f"Reference package library: {ref_lib}")
+
+# R refuses to load packages built by a newer R minor version, so a library keyed to a
+# different R than the image is a guaranteed failure. Only checked when the path actually
+# carries an R-<major>.<minor> component: a standalone BiocManager library says nothing
+# about its R version in its name, so there is nothing to compare and no warning to give.
+# Warn rather than abort, since the image and this constant can legitimately move together.
+r_component = next(
+    (p for p in ref_lib.split(os.sep) if re.fullmatch(r"R-\d+\.\d+", p)), None
+)
+if r_component and r_component != CONTAINER_R_VERSION:
+    print(
+        f"WARNING: {ref_lib} is a {r_component} library but the container image ships "
+        f"{CONTAINER_R_VERSION}. R will refuse to load packages built under a different "
+        "R minor version, so the munge step will fail until these agree.",
+        file=sys.stderr,
+    )
 
 # Pipeline ultimately needs to produce:
 #      1. fine-mapping decision file (both functional & regular, regular only, or none)
@@ -224,6 +344,20 @@ rule munge_gwas:
         munged = "results/{study}/munged/{study}_munged.tsv.gz",
         decision = "results/{study}/munged/{study}_fm_decision.txt"
     threads: 4
+    # Worth setting before running this on Kubernetes. The k8s executor turns threads
+    # into the pod's CPU request and mem_mb into both its memory request AND limit; with
+    # no mem_mb the pod is scheduled with no memory reservation at all and is first in
+    # line to be killed under node pressure. That surfaces as exit code 137, which the
+    # error handling below already reports as a likely OOM.
+    #
+    # disk_mb becomes the ephemeral-storage request and limit. It matters here because
+    # check_gwas_coverage decompresses the entire GWAS through mktemp, which lands in the
+    # pod's ephemeral storage unless $TMPDIR points somewhere shared. Either size disk_mb
+    # for the largest uncompressed GWAS, or keep temp files off ephemeral storage with:
+    #
+    #     --default-resources tmpdir="'/path/on/shared/fs'"
+    #
+    # Snakemake exports resources.tmpdir as $TMPDIR for the job, and mktemp honors it.
     # resources:
     #     mem_mb = 32000
 
@@ -235,7 +369,8 @@ rule munge_gwas:
         snp_high = config["finemap_thresholds"]["snp_high"],
         n_mid_low = config["finemap_thresholds"]["n_mid_low"],
         snp_mid_low = config["finemap_thresholds"]["snp_mid_low"],
-        timeout_h = config["munge_timeout_hours"]
+        timeout_h = config["munge_timeout_hours"],
+        ref_lib = ref_lib
     shell:
         r"""
 
@@ -245,6 +380,25 @@ rule munge_gwas:
             echo "$(date): ERROR - coverage check did not pass, refusing to munge" >> {params.log_path}
             exit 1
         fi
+
+        # The SNPlocs/BSgenome reference data packages are too large to ship in the
+        # container image, so they live in a shared R library on NFS. R_LIBS is prepended
+        # to .libPaths(), leaving the image's own site-library intact. Checked up front
+        # because the alternative is a four-hour job dying on "there is no package called
+        # 'SNPlocs.Hsapiens.dbSNP155.GRCh38'".
+        if [ ! -d "{params.ref_lib}" ]; then
+            echo "$(date): ERROR - reference library {params.ref_lib} not found or not mounted in this container" >> {params.log_path}
+            exit 1
+        fi
+        export R_LIBS="{params.ref_lib}"
+
+        for pkg in SNPlocs.Hsapiens.dbSNP155.GRCh38 SNPlocs.Hsapiens.dbSNP155.GRCh37 \
+                   BSgenome.Hsapiens.NCBI.GRCh38 BSgenome.Hsapiens.1000genomes.hs37d5; do
+            if [ ! -d "{params.ref_lib}/$pkg" ]; then
+                echo "$(date): ERROR - reference package $pkg missing from {params.ref_lib}" >> {params.log_path}
+                exit 1
+            fi
+        done
 
         FNAME=$(cat {input.file_name})
 

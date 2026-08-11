@@ -76,7 +76,37 @@ studies:
   # - "GCST005686"
   # - "GCST90013538"
   # - "GCST90104347" 
-use_functional_annotations: false # Should functional fine-mapping be implemented, if indicated 
+# Container image every rule in pipeline_munge/Snakefile runs inside, built from the
+# Dockerfile at the repo root by .github/workflows/build-image.yaml. Prefer an immutable
+# tag (a release tag, or main-<sha>) over :latest so a rerun months from now uses the
+# same MungeSumstats that produced the results already on disk.
+#
+# On the Kubernetes executor this same value must also be passed as --container-image;
+# the plugin does not read the Snakefile's container: directive. See the Snakefile header.
+container: "ghcr.io/benaroyaresearch/fm_2026:latest"
+
+# R library holding the four SNPlocs/BSgenome reference data packages that
+# munge_sumstats.R loads. Roughly 13 GB, so they are kept out of the container image and
+# exported as R_LIBS by munge_gwas instead.
+#
+# Deliberately not set here. The Snakefile discovers the renv project library at
+# renv/library/<platform>/<R-version>/<arch> and resolves it to an absolute path, so
+# nothing machine-specific has to be committed — run renv::restore() from the project
+# root and it is found wherever the project happens to live.
+#
+# renv's library entries are symlinks into the shared /renv cache, so job pods must mount
+# BOTH the project directory and /renv. If /renv is missing the symlinks dangle, and
+# munge_gwas aborts on its pre-flight check rather than failing hours later inside R.
+#
+# The library must be built against the same R/Bioconductor as the image (R 4.4 /
+# Bioconductor 3.20); the Snakefile warns if the discovered path is keyed to another R.
+#
+# Uncomment only to override the discovery — e.g. for a standalone BiocManager library
+# (see the Dockerfile header for that install command), or when several renv libraries
+# exist and one has to be chosen. --config ref_lib=/path works too, without editing this.
+# ref_lib: "/nfs/.../R-4.4-bioc-3.20"
+
+use_functional_annotations: false # Should functional fine-mapping be implemented, if indicated
 finemap_thresholds:
   n_high: 100000 # Threshold for high sample size (one of the eligibility requirements for functional fine-mapping)
   snp_high: 2000000 # Threshold for high SNP count (one of the eligibility requirements for functional fine-mapping)

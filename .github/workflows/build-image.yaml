@@ -1,0 +1,121 @@
+# Builds the pipeline_munge container and publishes it to
+# ghcr.io/benaroyaresearch/fm_2026.
+#
+# The repository lives under the BenaroyaResearch org, so the automatic GITHUB_TOKEN
+# already has permission to write that package — no PAT needed. The package inherits the
+# repo's visibility on first publish; if the cluster pulls anonymously, make it public
+# under Packages -> fm_2026 -> Package settings.
+#
+# Tagging follows the same convention as the coder-templates repo:
+#
+#   pull request      -> pr-<number>-<short sha>   (built only, not pushed)
+#   push to main      -> latest, main-<short sha>
+#   release published -> the release tag (e.g. v1.0.1)
+#
+# Releases do not also move :latest. Every release is cut from main, which already
+# published :latest for that commit, so re-tagging here would only add a way for the two
+# to disagree.
+#
+# Pin config/config_munge.yaml at an immutable tag (a release tag or main-<sha>) rather
+# than :latest, so a rerun months from now uses the same MungeSumstats that produced the
+# results already on disk.
+
+name: Build and publish munge image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - .github/workflows/build-image.yaml
+  pull_request:
+    paths:
+      - Dockerfile
+      - .github/workflows/build-image.yaml
+  release:
+    types: [published]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: benaroyaresearch/fm_2026
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      # No disk reclaim step here on purpose. A stock ubuntu-latest runner reports 88 GB
+      # free on / (measured on run 31510097800), against a ~1.6 GB base and a ~350 MB R
+      # layer, so deleting the preinstalled toolchains would only cost time. If a future
+      # change grows the image by an order of magnitude, reclaiming /usr/share/dotnet,
+      # /usr/local/lib/android and $AGENT_TOOLSDIRECTORY is the first thing to add back,
+      # and moving runs-on to a larger or self-hosted runner is the next.
+      #
+      # These action versions run on Node 24 and need Actions Runner v2.327.1 or newer,
+      # which GitHub-hosted runners have but a self-hosted one may not.
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # Skipped for pull requests: nothing is pushed, so no credentials are needed.
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive tags
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # type=sha takes no event= attribute (that is type=ref only), so it must be
+          # gated with enable= instead. Gating on is_default_branch also guarantees
+          # {{branch}} is non-empty — on a pull_request it expands to nothing, which
+          # produced the invalid tag ":-<sha>".
+          tags: |
+            type=ref,event=pr,prefix=pr-,suffix=-{{sha}}
+            type=sha,prefix={{branch}}-,enable={{is_default_branch}}
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=tag
+          labels: |
+            org.opencontainers.image.title=fm_2026
+            org.opencontainers.image.description=pipeline_munge: GWAS download, coverage QC, and MungeSumstats munge to GRCh38
+
+      # linux/amd64 only. The cluster is amd64, and cross-building the R layer under
+      # emulation would take hours for no benefit.
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Layer cache lives in the GitHub Actions cache, so a Dockerfile edit that
+          # only touches the verification steps does not reinstall all of Bioconductor.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The image's own RUN steps already assert that every tool, R package, and the
+      # Snakemake/pandas pair load correctly — a broken build fails before this point.
+      # This re-runs those entry points against the finished image, which also catches a
+      # bad final layer or a botched tag.
+      # Pulls the tag back from GHCR, so this doubles as proof the push landed.
+      - name: Smoke-test the built image
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          TAG=$(echo "${{ steps.meta.outputs.tags }}" | head -1)
+          echo "testing $TAG"
+          docker run --rm "$TAG" bash -c 'command -v curl file gzip timeout Rscript snakemake'
+          docker run --rm "$TAG" snakemake --version
+          docker run --rm "$TAG" Rscript -e 'library(MungeSumstats); cat("MungeSumstats", as.character(packageVersion("MungeSumstats")), "\n")'

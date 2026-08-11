@@ -1,0 +1,4 @@
+# The Dockerfile COPYs nothing — every dependency comes from the base image, apt, or
+# BiocManager. Excluding everything keeps the build context empty so `docker build .`
+# does not tar up results/ (multi-GB GWAS downloads) and ship it to the daemon.
+*
