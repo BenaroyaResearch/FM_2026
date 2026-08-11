@@ -115,6 +115,22 @@ RUN Rscript -e ' \
     ' \
     && rm -rf /tmp/downloaded_packages /tmp/Rtmp*
 
+# The project has an renv .Rprofile, and R sources it whenever Rscript starts in the
+# project root — which is exactly what munge_gwas does. Left enabled, renv's autoloader
+# downloads and bootstraps renv inside every job pod, then REPLACES .libPaths() with the
+# project library alone, discarding this image's site-library and making MungeSumstats
+# unfindable despite being installed here.
+#
+# Disabling the autoloader makes .Rprofile inert inside the container without touching
+# the file, so the image stays the source of truth for R packages and the reference
+# library is layered on top via R_LIBS (set by the munge_gwas rule). renv remains fully
+# active for interactive work in the Coder workspace; this only affects containers.
+#
+# Remove this if you would rather renv own the whole library inside pods. That also means
+# installing renv here so pods do not bootstrap over the network, and giving the sandbox
+# a writable path, since pods do not necessarily run as root.
+ENV RENV_CONFIG_AUTOLOADER_ENABLED=FALSE
+
 # ---------------------------------------------------------------------------
 # 3. Snakemake + pandas
 # ---------------------------------------------------------------------------

@@ -83,6 +83,11 @@ container: config["container"]
 #
 # Set ref_lib in the config (or --config ref_lib=/path) to override, which is what a
 # standalone BiocManager library needs.
+#
+# The library is layered on top of the image's own packages via R_LIBS rather than
+# replacing them. That is why the image sets RENV_CONFIG_AUTOLOADER_ENABLED=FALSE: the
+# project's renv .Rprofile would otherwise take over .libPaths() inside every pod and hide
+# the image's MungeSumstats. See the Dockerfile for the full reasoning.
 
 # Path component renv uses for the R version, which must match the image's R. Update
 # this alongside the Bioconductor release in the Dockerfile.
