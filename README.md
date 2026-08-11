@@ -114,8 +114,33 @@ wrapper still works:
 ./run_munge.sh dryrun --config ref_lib=/tmp      # skip the library check entirely
 ```
 
-Environment overrides: `SNAKEMAKE` (binary path), `PROFILE` (default `coder`), `JOBS`
-(default 4), `IMAGE` (default: the `container:` key in `config/config_munge.yaml`).
+Environment overrides: `SNAKEMAKE` (binary path), `PROFILE` (default `coder`), `IMAGE`
+(default: the `container:` key in `config/config_munge.yaml`).
+
+#### Concurrency caps
+
+With a long `studies:` list the pipeline will happily run many studies at once, which is
+rarely what you want here: each munge asks for 64 GB, and each download is a multi-GB pull
+from the same EBI FTP server.
+
+| Variable | Default | Caps |
+|---|---|---|
+| `JOBS` | 4 | jobs in flight overall (snakemake `--jobs`) |
+| `MAX_JOBS` | 8 | hard ceiling on `JOBS` itself |
+| `MAX_DOWNLOADS` | 2 | simultaneous GWAS downloads |
+| `MAX_MUNGES` | 2 | simultaneous munges, i.e. 2 x 64 GB |
+
+```bash
+MAX_MUNGES=1 ./run_munge.sh start          # one munge at a time
+JOBS=8 MAX_DOWNLOADS=4 ./run_munge.sh start
+MAX_JOBS=16 JOBS=16 ./run_munge.sh start   # deliberately raise the ceiling
+```
+
+`JOBS` above `MAX_JOBS` is clamped with a note rather than silently honoured, and all four
+are validated as positive integers before any pods are created. The two per-rule caps exist
+because `--jobs` cannot express them; they are enforced by the driver's scheduler through
+`--resources`, so they apply on any executor. The effective limit for a rule is the smaller
+of its own cap and `JOBS`, and the wrapper says so if you set one above `JOBS`.
 
 #### What the wrapper sets for you
 

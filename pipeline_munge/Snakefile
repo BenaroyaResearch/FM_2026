@@ -226,6 +226,14 @@ rule download_gwas:
         "results/{study}/raw/{study}_filename.txt"
     output:
         "results/{study}/raw/{study}_sumstats.tsv.gz"
+    # Global throttle on how many of these run at once, independent of --jobs. Each one is
+    # a multi-GB pull from the EBI FTP server, so a large study list would otherwise open
+    # as many simultaneous connections as --jobs allows and risk being throttled.
+    #
+    # Unconstrained unless the run supplies a ceiling with --resources downloads=N;
+    # run_munge.sh always does.
+    resources:
+        downloads = 1
     params:
         dir_url = lambda wildcards: study_info[wildcards.study]["GWAS_dir_url"],
         log_path = lambda wildcards: study_info[wildcards.study]["log_file"]
@@ -406,8 +414,14 @@ rule munge_gwas:
     #
     # Snakemake exports resources.tmpdir as $TMPDIR for the job, and mktemp honors it.
     # run_munge.sh at the project root does this for you.
+    #
+    # munge_slots throttles how many munges run concurrently, independent of --jobs. This
+    # is the expensive rule: at 64 GB each, four in parallel asks a shared cluster for
+    # 256 GB at once and the surplus pods simply sit Pending. Unconstrained unless the run
+    # supplies a ceiling with --resources munge_slots=N; run_munge.sh always does.
     resources:
-        mem_mb = munge_mem_mb
+        mem_mb = munge_mem_mb,
+        munge_slots = 1
 
     # Required for shell/munging
     params:
