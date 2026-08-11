@@ -9,7 +9,17 @@
 import pandas as pd
 import sys, os, glob, re
 
-workdir: "../"
+# Every path in this file — config/, results/, the renv library — is written relative to the
+# project root, one level above this Snakefile.
+#
+# Derived from workflow.basedir rather than written as "../" because the Kubernetes executor
+# applies this directive twice. The driver resolves it and passes the result as each job pod's
+# working directory, then the pod re-parses this Snakefile (see Containerization below) and
+# applies it a second time. A relative "../" therefore climbs one level too far inside the
+# pod, and the run dies on "Workflow defines configfile config/config_munge.yaml but it is
+# not present" pointing at the parent of the project. An absolute path is idempotent, so the
+# driver and the pod both land in the project root.
+workdir: os.path.dirname(workflow.basedir)
 
 # Adds shared folder (folder used for both pipelines) to Python's search path so Snakefile always
 # has access. 
@@ -334,6 +344,34 @@ rule check_gwas_coverage:
         echo "PASS" > {output}
         """
 
+# ---------------------------------------------------------------------------
+# munge_gwas memory escalation
+# ---------------------------------------------------------------------------
+# MungeSumstats' peak memory scales with the GWAS, and studies that pass the coverage
+# check can still differ severalfold in what they actually need. Rather than commit to
+# one number that is either wasteful for most studies or fatal for the big ones, mem_mb
+# is a function of Snakemake's `attempt` counter: the job starts at the first entry
+# below and each retry moves one entry up, so only the studies that genuinely need more
+# memory pay for it.
+#
+# Retrying is cheap here because download_gwas skips the download when the sumstats file
+# is already present — a munge retry re-runs the munge, not the multi-GB download.
+#
+# On Kubernetes mem_mb becomes both the pod's memory request AND its limit. An entry
+# larger than the largest node's allocatable memory therefore leaves the pod Pending
+# indefinitely instead of failing fast, which is why this is a clamped schedule rather
+# than a multiplier — keep the last entry under what a node can actually satisfy.
+#
+# Override per-run without editing this file:
+#     --config munge_mem_mb_schedule="[65536, 131072]"
+MUNGE_MEM_MB_SCHEDULE = config.get("munge_mem_mb_schedule", [65536, 98304, 131072])
+
+
+def munge_mem_mb(wildcards, attempt):
+    """Memory for attempt N, clamped to the last entry so extra retries reuse the top."""
+    return MUNGE_MEM_MB_SCHEDULE[min(attempt, len(MUNGE_MEM_MB_SCHEDULE)) - 1]
+
+
 # Purpose: munge GWAS to clean for downstream fine-mapping
 rule munge_gwas:
     input:
@@ -344,22 +382,32 @@ rule munge_gwas:
         munged = "results/{study}/munged/{study}_munged.tsv.gz",
         decision = "results/{study}/munged/{study}_fm_decision.txt"
     threads: 4
-    # Worth setting before running this on Kubernetes. The k8s executor turns threads
-    # into the pod's CPU request and mem_mb into both its memory request AND limit; with
-    # no mem_mb the pod is scheduled with no memory reservation at all and is first in
-    # line to be killed under node pressure. That surfaces as exit code 137, which the
-    # error handling below already reports as a likely OOM.
+    # Two retries so the three-entry schedule above is exhausted: attempts get 64, 96
+    # then 128 GB. Declared on the rule rather than left to --retries on the command
+    # line so the escalation happens however the pipeline is launched.
     #
-    # disk_mb becomes the ephemeral-storage request and limit. It matters here because
-    # check_gwas_coverage decompresses the entire GWAS through mktemp, which lands in the
-    # pod's ephemeral storage unless $TMPDIR points somewhere shared. Either size disk_mb
-    # for the largest uncompressed GWAS, or keep temp files off ephemeral storage with:
+    # Note this retries *every* failure of this rule, not just OOM kills. The pre-flight
+    # checks below (coverage did not pass, reference library missing) fail in seconds, so
+    # retrying them is cheap — but a run that hits the {params.timeout_h}h timeout will
+    # be retried too. Set retries: 0 to disable if that matters more than the escalation.
+    retries: 2
+    # The k8s executor turns threads into the pod's CPU request and mem_mb into both its
+    # memory request AND limit; with no mem_mb the pod is scheduled with no memory
+    # reservation at all and is first in line to be killed under node pressure. That
+    # surfaces as exit code 137, which the error handling below reports as a likely OOM.
+    #
+    # disk_mb becomes the ephemeral-storage request and limit. It matters more in
+    # check_gwas_coverage, which decompresses the entire GWAS through mktemp, landing in
+    # the pod's ephemeral storage unless $TMPDIR points somewhere shared. Either size
+    # disk_mb for the largest uncompressed GWAS, or keep temp files off ephemeral storage
+    # with:
     #
     #     --default-resources tmpdir="'/path/on/shared/fs'"
     #
     # Snakemake exports resources.tmpdir as $TMPDIR for the job, and mktemp honors it.
-    # resources:
-    #     mem_mb = 32000
+    # run_munge.sh at the project root does this for you.
+    resources:
+        mem_mb = munge_mem_mb
 
     # Required for shell/munging
     params:

@@ -30,3 +30,8 @@ find_missing_GWASs.py
 *.md
 *.qmd
 .env
+# Scratch dir run_munge.sh points $TMPDIR at, so check_gwas_coverage's decompression
+# stays off pod ephemeral storage
+.tmp/
+
+__pycache__/

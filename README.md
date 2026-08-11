@@ -1,5 +1,151 @@
 # 2026 FM Pipeline Documentation
 
+Sections 1-4 below document how the pipeline works, stage by stage. The two sections
+immediately following are the practical "how do I run this" instructions: set up the R
+reference library once, then launch with `run_munge.sh`.
+
+
+## Setup: R reference library (renv)
+
+`munge_sumstats.R` needs four SNPlocs/BSgenome reference data packages. They come to
+roughly 13 GB, which is too large to ship inside the container image, so they live in the
+project's renv library and are mounted into the job pods instead. The container carries
+MungeSumstats; the renv library carries the reference data. Both are needed.
+
+The library **must be built against R 4.4 / Bioconductor 3.20**, matching the image
+(`bioconductor/bioconductor_docker:RELEASE_3_20`, R 4.4.2). R refuses to load packages
+built by a newer R minor version, so a mismatch is a guaranteed failure — and it surfaces
+hours in, at the end of a long munge, not at launch.
+
+Run once per checkout, from the project root:
+
+```bash
+# 1. Confirm R is 4.4.x. If it is not, switch R before going further.
+R --version                      # expect: R version 4.4.2
+
+# 2. Point renv at the shared package cache. Without this, restore compiles ~13 GB from
+#    source; with it, packages are symlinked out of the cache in minutes. The workspace
+#    image normally sets this already.
+export RENV_PATHS_CACHE=/renv
+
+# 3. Restore. .Rprofile bootstraps renv automatically, so no install step is needed.
+R -e 'renv::restore(prompt = FALSE)'
+```
+
+Then verify the four data packages actually landed — this is exactly what `munge_gwas`
+pre-flight checks before it starts:
+
+```bash
+ls -d renv/library/*/*/*/{SNPlocs.Hsapiens.dbSNP155.GRCh38,SNPlocs.Hsapiens.dbSNP155.GRCh37,BSgenome.Hsapiens.NCBI.GRCh38,BSgenome.Hsapiens.1000genomes.hs37d5}
+```
+
+And confirm the Snakefile discovers it, which prints the resolved absolute path:
+
+```bash
+./run_munge.sh dryrun | head -2
+# Running 1 studies: ['GCST90132226']
+# Reference package library: /home/<you>/FM_2026/renv/library/linux-ubuntu-noble/R-4.4/x86_64-pc-linux-gnu
+```
+
+Things that go wrong here:
+
+- **"no reference package library found"** — `renv::restore()` has not been run, or it was
+  run from somewhere other than the project root.
+- **"multiple renv libraries found"** — more than one directory matches
+  `renv/library/*/*/*`, usually left over from an R upgrade. Delete the stale one, or name
+  the right one via `ref_lib:` in `config/config_munge.yaml`.
+- **A warning that the library is `R-4.3` (or similar) but the image ships `R-4.4`** — the
+  library was built under the wrong R. Rebuild it under R 4.4.
+- **Dangling symlinks.** renv library entries point into the shared `/renv` cache, so job
+  pods must mount both the project directory and `/renv`. The `coder` profile does both.
+
+To use a standalone BiocManager library instead of renv, see the install command in the
+Dockerfile header and set `ref_lib:` in `config/config_munge.yaml` (or pass
+`--config ref_lib=/path`).
+
+Note: keep credentials such as `GITHUB_PAT` in `~/.Renviron`, never in a project-level
+`.Renviron` — the latter sits inside the repo and gets committed.
+
+
+## Running: run_munge.sh
+
+`run_munge.sh` at the project root launches the munge pipeline detached under `nohup` and
+gives you a clean way to stop it. Runs are long — tens of minutes per GWAS download, up to
+`munge_timeout_hours` per munge — so they need to survive the terminal closing.
+
+Before launching: list the GCST IDs you want in `studies:` in `config/config_munge.yaml`,
+and make sure each one has a row in `config/study_table.tsv`.
+
+```bash
+conda activate snakemake          # or: export SNAKEMAKE=/path/to/bin/snakemake
+
+./run_munge.sh dryrun             # check the DAG and library discovery, creates no pods
+./run_munge.sh start              # launch detached
+./run_munge.sh log                # follow the live log
+./run_munge.sh status             # alive? last log lines? which k8s jobs?
+./run_munge.sh cancel             # graceful stop
+```
+
+Results land in `results/{study}/` inside the project directory, and each study's log at
+`results/{study}/{study}.log`. The driver's own log goes to `logs/munge_<timestamp>.log`,
+with `logs/munge_latest.log` symlinked to the newest.
+
+Extra arguments are passed straight through to snakemake, so anything not covered by the
+wrapper still works:
+
+```bash
+./run_munge.sh start --rerun-incomplete
+./run_munge.sh start --config munge_mem_mb_schedule="[65536, 131072]"
+./run_munge.sh dryrun --config ref_lib=/tmp      # skip the library check entirely
+```
+
+Environment overrides: `SNAKEMAKE` (binary path), `PROFILE` (default `coder`), `JOBS`
+(default 4), `IMAGE` (default: the `container:` key in `config/config_munge.yaml`).
+
+#### What the wrapper sets for you
+
+- `--container-image`, read back out of `config/config_munge.yaml`. The Kubernetes executor
+  ignores the Snakefile's `container:` directive and needs the image named on the command
+  line, so reading the same config key keeps the two from drifting.
+- `--default-resources tmpdir=<project>/.tmp`, keeping `check_gwas_coverage`'s full
+  decompression of the GWAS on shared storage instead of filling the pod's ephemeral disk.
+- Baseline `mem_mb`/`disk_mb` for the small rules. `munge_gwas` is deliberately left alone
+  so it uses the escalating schedule declared in the Snakefile — see below.
+
+#### Cancelling
+
+`cancel` sends **SIGINT**, which snakemake traps: it cancels the Kubernetes jobs it
+submitted and releases the `.snakemake` lock on the way out. It escalates to SIGTERM then
+SIGKILL only if the driver is still alive after 120s, and in that case jobs may be
+orphaned. `cancel --force` additionally deletes any leftover `snakejob-*` jobs — opt-in
+because the name pattern cannot tell your jobs apart from a concurrent run's.
+
+If a run is killed rather than interrupted, the next `start` may fail on a stale lock.
+Clear it with `./run_munge.sh unlock`.
+
+Listing and sweeping Kubernetes jobs needs `kubectl` on PATH; the wrapper says so
+explicitly when it is missing rather than silently reporting nothing to clean.
+
+#### munge_gwas memory
+
+`munge_gwas` requests 64 GB on its first attempt and escalates on retry — 64, then 96, then
+128 GB — via a `mem_mb` callable keyed to snakemake's `attempt` counter, with `retries: 2`
+declared on the rule. Retrying is cheap because `download_gwas` skips a download that is
+already on disk, so a retry re-runs only the munge.
+
+Tune the schedule without editing the Snakefile:
+
+```bash
+./run_munge.sh start --config munge_mem_mb_schedule="[65536, 131072, 196608]"
+```
+
+Two caveats. On Kubernetes `mem_mb` is both the pod's memory request *and* its limit, so an
+entry larger than any node's allocatable memory leaves the pod `Pending` indefinitely
+rather than failing fast — keep the top entry under what a node can actually satisfy. And
+`retries` applies to every failure of the rule, not just OOM kills: the pre-flight checks
+fail in seconds so retrying them is cheap, but a run that hits the `munge_timeout_hours`
+limit is retried too. Set `retries: 0` on the rule to disable escalation.
+
 
 ## 1: Build study table
 
