@@ -51,21 +51,15 @@ jobs:
       - name: Check out
         uses: actions/checkout@v7
 
-      # The base is ~1.6 GB compressed and the R layer adds a couple of GB on top. A
-      # stock ubuntu-latest runner has roughly 14 GB free on /, which is enough but not
-      # by much, so reclaim the preinstalled toolchains this build never touches.
-      # If the build ever fails with "no space left on device", that is the signal to
-      # move to a larger or self-hosted runner via runs-on above. Note that these action
-      # versions run on Node 24 and need Actions Runner v2.327.1 or newer, which
-      # GitHub-hosted runners already have but a self-hosted one may not.
-      - name: Reclaim runner disk
-        run: |
-          echo "before:"; df -h / | tail -1
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
-          sudo docker image prune --all --force || true
-          echo "after:"; df -h / | tail -1
-
+      # No disk reclaim step here on purpose. A stock ubuntu-latest runner reports 88 GB
+      # free on / (measured on run 31510097800), against a ~1.6 GB base and a ~350 MB R
+      # layer, so deleting the preinstalled toolchains would only cost time. If a future
+      # change grows the image by an order of magnitude, reclaiming /usr/share/dotnet,
+      # /usr/local/lib/android and $AGENT_TOOLSDIRECTORY is the first thing to add back,
+      # and moving runs-on to a larger or self-hosted runner is the next.
+      #
+      # These action versions run on Node 24 and need Actions Runner v2.327.1 or newer,
+      # which GitHub-hosted runners have but a self-hosted one may not.
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v4
 
