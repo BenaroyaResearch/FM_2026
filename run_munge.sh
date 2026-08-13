@@ -188,6 +188,23 @@ activate_conda_env() {
     info "conda env:  $env"
 }
 
+# Snakemake builds a run header that calls getpass.getuser(), which reads LOGNAME/USER/LNAME/
+# USERNAME first and only falls back to /etc/passwd. Workspace pods here run as an arbitrary
+# uid with no passwd entry, so when those variables are also unset the driver aborts with
+# "OSError: No username set in the environment" before it even builds the DAG. The value is
+# only ever printed, so any stable non-empty string will do.
+ensure_username() {
+    [[ -n "${USER:-}" || -n "${LOGNAME:-}" ]] && return 0
+
+    local name
+    name=$(id -un 2>/dev/null) || name=""          # fails for the same reason getuser() does
+    [[ -n "$name" ]] || name=$(basename "${HOME:-}" 2>/dev/null)
+    [[ -n "$name" && "$name" != "/" ]] || name="uid-$(id -u)"
+
+    export USER="$name" LOGNAME="$name"
+    info "note: USER and LOGNAME were unset, which snakemake treats as fatal; using USER=$name."
+}
+
 find_snakemake() {
     if [[ -n "${SNAKEMAKE:-}" ]]; then
         [[ -x "$SNAKEMAKE" ]] || die "SNAKEMAKE=$SNAKEMAKE is not executable"
@@ -272,6 +289,7 @@ cmd_start() {
 
     apply_caps
     activate_conda_env
+    ensure_username
     snakemake_bin=$(find_snakemake)
     image=$(find_image)
     mkdir -p "$LOG_DIR" "$TMP_DIR"
@@ -304,6 +322,7 @@ cmd_dryrun() {
     local snakemake_bin
     apply_caps
     activate_conda_env
+    ensure_username
     snakemake_bin=$(find_snakemake)
     mkdir -p "$TMP_DIR"
     local -a args
@@ -415,6 +434,7 @@ cmd_unlock() {
         die "a run is still active — cancel it before unlocking."
     fi
     activate_conda_env
+    ensure_username
     snakemake_bin=$(find_snakemake)
     "$snakemake_bin" --snakefile "$SNAKEFILE" --unlock
 }

@@ -160,6 +160,18 @@ Activation is only needed at launch. `start` resolves the binary to an absolute 
 `conda deactivate`. `status`, `log`, and `cancel` never need the env at all — they work from
 the PID file, so you can stop a run from a fresh shell.
 
+#### Username in the environment
+
+Snakemake's run header calls `getpass.getuser()`, which reads `LOGNAME`/`USER`/`LNAME`/
+`USERNAME` and only then falls back to `/etc/passwd`. Workspace pods run as an arbitrary uid
+with no passwd entry, so if those variables are unset too, the driver dies with
+`OSError: No username set in the environment` before building the DAG — and the traceback
+points at `getpass`, not at anything in this pipeline.
+
+The wrapper exports `USER`/`LOGNAME` when they are missing, preferring `id -un`, then the
+basename of `$HOME`, then `uid-<n>`. The value is only printed in the header, so any stable
+string works. Set `USER` yourself if you want a specific name in the logs.
+
 #### Concurrency caps
 
 With a long `studies:` list the pipeline will happily run many studies at once, which is
