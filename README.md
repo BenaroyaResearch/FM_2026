@@ -92,7 +92,7 @@ Before launching: run `./setup_renv.sh` once (above), list the GCST IDs you want
 `config/study_table.tsv`.
 
 ```bash
-conda activate snakemake          # or: export SNAKEMAKE=/path/to/bin/snakemake
+conda activate bri-snakemake      # or: export SNAKEMAKE=/path/to/bin/snakemake
 
 ./run_munge.sh dryrun             # check the DAG and library discovery, creates no pods
 ./run_munge.sh start              # launch detached
@@ -114,8 +114,29 @@ wrapper still works:
 ./run_munge.sh dryrun --config ref_lib=/tmp      # skip the library check entirely
 ```
 
-Environment overrides: `SNAKEMAKE` (binary path), `PROFILE` (default `coder`), `IMAGE`
-(default: the `container:` key in `config/config_munge.yaml`).
+Environment overrides: `SNAKEMAKE` (binary path), `CONDA_ENV` (env to activate first, see
+below), `PROFILE` (default `coder`), `IMAGE` (default: the `container:` key in
+`config/config_munge.yaml`).
+
+#### Letting the wrapper activate the env
+
+The wrapper does not activate conda for you by default — it looks for `SNAKEMAKE`, then for
+`snakemake` on `PATH`. For a fresh shell or a cron entry, `CONDA_ENV` makes it do the
+activation itself:
+
+```bash
+CONDA_ENV=bri-snakemake ./run_munge.sh start
+```
+
+It sources conda's shell hook before activating, because `conda activate` is a shell
+function and non-interactive bash never reads `~/.bashrc`. Set `CONDA_EXE` as well if
+`conda` is not on `PATH`. `SNAKEMAKE` takes precedence when both are set, and the script
+says so rather than activating silently.
+
+Activation is only needed at launch. `start` resolves the binary to an absolute path before
+`nohup`ing it, so the detached driver keeps running after you close the terminal or
+`conda deactivate`. `status`, `log`, and `cancel` never need the env at all — they work from
+the PID file, so you can stop a run from a fresh shell.
 
 #### Concurrency caps
 

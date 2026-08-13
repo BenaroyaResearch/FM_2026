@@ -33,7 +33,7 @@
 # is PEP 668 "externally managed", so uv installs Snakemake into its own environment
 # instead of forcing --break-system-packages onto the system interpreter.
 # SNAKEMAKE_VERSION must match the driver running in
-# the Coder workspace (`conda activate snakemake; snakemake --version`) — a mismatched
+# the Coder workspace (`conda activate bri-snakemake; snakemake --version`) — a mismatched
 # pod version is the usual cause of jobs failing immediately with argument errors.
 #
 # ---------------------------------------------------------------------------

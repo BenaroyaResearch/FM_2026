@@ -50,7 +50,7 @@ print(f"Running {len(study_info)} studies: {list(study_info.keys())}")
 #       inside that pod to execute the rule. So the image must be named on the command
 #       line as well:
 #
-#           conda activate snakemake
+#           conda activate bri-snakemake
 #           snakemake --profile coder --jobs <n> \
 #                     --container-image ghcr.io/benaroyaresearch/fm_2026:<tag> \
 #                     --latency-wait 120 --keep-going --default-resources

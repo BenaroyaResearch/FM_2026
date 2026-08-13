@@ -17,6 +17,8 @@
 #
 # Environment overrides:
 #   SNAKEMAKE      path to the snakemake binary   (default: first on PATH)
+#   CONDA_ENV      conda env to activate first    (default: none — activate it yourself,
+#                                                  or set this to have the script do it)
 #   PROFILE        snakemake profile name         (default: coder)
 #   IMAGE          container image                (default: the container: key in
 #                                                  config/config_munge.yaml, so the flag the
@@ -98,6 +100,52 @@ apply_caps() {
 
 # --- discovery -------------------------------------------------------------
 
+# Opt-in: CONDA_ENV=<name> has this script activate the env itself, so a fresh shell or a
+# cron entry does not have to. Off by default, and SNAKEMAKE wins when both are set —
+# activating implicitly could otherwise run the pipeline under a different interpreter than
+# the one the caller has active, which is a confusing thing to debug.
+#
+# `conda activate` is a shell function that conda's hook defines, and non-interactive bash
+# never sources ~/.bashrc, so the hook has to be sourced explicitly here.
+#
+# This must run in the current shell rather than a command substitution: the PATH and
+# CONDA_PREFIX it exports have to be inherited by the driver cmd_start launches.
+activate_conda_env() {
+    [[ -n "${CONDA_ENV:-}" ]] || return 0
+
+    if [[ -n "${SNAKEMAKE:-}" ]]; then
+        info "note: SNAKEMAKE is set, so CONDA_ENV=$CONDA_ENV is ignored."
+        return 0
+    fi
+
+    # Already active — re-activating would only stack a second layer of the same env.
+    [[ "${CONDA_DEFAULT_ENV:-}" == "$CONDA_ENV" ]] && return 0
+
+    local conda_exe base hook
+    conda_exe="${CONDA_EXE:-$(command -v conda || true)}"
+    [[ -n "$conda_exe" && -x "$conda_exe" ]] \
+        || die "CONDA_ENV=$CONDA_ENV is set but no conda binary was found.
+  Set CONDA_EXE=/path/to/bin/conda, or skip conda entirely:
+  SNAKEMAKE=/path/to/envs/$CONDA_ENV/bin/snakemake $0 $*"
+
+    base=$("$conda_exe" info --base) \
+        || die "'$conda_exe info --base' failed, so conda's shell hook cannot be located"
+    hook="$base/etc/profile.d/conda.sh"
+    [[ -r "$hook" ]] || die "conda's shell hook is not readable at $hook"
+
+    # conda's hook and activation scripts are not written for strict mode: they dereference
+    # unset variables, which aborts under the set -u at the top of this file. Both flags go
+    # off for the duration and back on immediately after.
+    set +eu
+    # shellcheck source=/dev/null
+    source "$hook" || { set -eu; die "failed to source conda's shell hook at $hook"; }
+    conda activate "$CONDA_ENV" \
+        || { set -eu; die "'conda activate $CONDA_ENV' failed. List the names with '$conda_exe env list'."; }
+    set -eu
+
+    info "conda env:  $CONDA_ENV"
+}
+
 find_snakemake() {
     if [[ -n "${SNAKEMAKE:-}" ]]; then
         [[ -x "$SNAKEMAKE" ]] || die "SNAKEMAKE=$SNAKEMAKE is not executable"
@@ -109,8 +157,9 @@ find_snakemake() {
         return
     fi
     die "snakemake not found on PATH.
-  Activate the environment first (conda activate snakemake),
-  or point at it directly: SNAKEMAKE=/path/to/bin/snakemake $0 $*"
+  Activate the environment first (conda activate bri-snakemake),
+  have this script do it (CONDA_ENV=bri-snakemake $0 $*),
+  or point at the binary directly: SNAKEMAKE=/path/to/bin/snakemake $0 $*"
 }
 
 # The k8s executor plugin ignores the Snakefile's container: directive and needs the image
@@ -178,6 +227,7 @@ cmd_start() {
     fi
 
     apply_caps
+    activate_conda_env
     snakemake_bin=$(find_snakemake)
     image=$(find_image)
     mkdir -p "$LOG_DIR" "$TMP_DIR"
@@ -209,6 +259,7 @@ cmd_start() {
 cmd_dryrun() {
     local snakemake_bin
     apply_caps
+    activate_conda_env
     snakemake_bin=$(find_snakemake)
     mkdir -p "$TMP_DIR"
     local -a args
@@ -316,15 +367,16 @@ cmd_cancel() {
 
 cmd_unlock() {
     local snakemake_bin
-    snakemake_bin=$(find_snakemake)
     if running_pid >/dev/null; then
         die "a run is still active — cancel it before unlocking."
     fi
+    activate_conda_env
+    snakemake_bin=$(find_snakemake)
     "$snakemake_bin" --snakefile "$SNAKEFILE" --unlock
 }
 
 usage() {
-    sed -n '3,34p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '3,36p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 case "${1:-}" in
