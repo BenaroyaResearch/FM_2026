@@ -17,8 +17,9 @@
 #
 # Environment overrides:
 #   SNAKEMAKE      path to the snakemake binary   (default: first on PATH)
-#   CONDA_ENV      conda env to activate first    (default: none — activate it yourself,
-#                                                  or set this to have the script do it)
+#   CONDA_ENV      conda env to activate first    (default: bri-snakemake, activated only
+#                                                  when snakemake is not already on PATH.
+#                                                  Takes a name or a full prefix path.)
 #   PROFILE        snakemake profile name         (default: coder)
 #   IMAGE          container image                (default: the container: key in
 #                                                  config/config_munge.yaml, so the flag the
@@ -48,6 +49,9 @@ PID_FILE="$LOG_DIR/munge.pid"
 LATEST_LOG="$LOG_DIR/munge_latest.log"
 
 PROFILE="${PROFILE:-coder}"
+
+# Activated only when snakemake is not already available — see activate_conda_env.
+DEFAULT_CONDA_ENV="${DEFAULT_CONDA_ENV:-bri-snakemake}"
 
 # Concurrency caps.
 #
@@ -100,10 +104,27 @@ apply_caps() {
 
 # --- discovery -------------------------------------------------------------
 
-# Opt-in: CONDA_ENV=<name> has this script activate the env itself, so a fresh shell or a
-# cron entry does not have to. Off by default, and SNAKEMAKE wins when both are set —
-# activating implicitly could otherwise run the pipeline under a different interpreter than
-# the one the caller has active, which is a confusing thing to debug.
+# Report a failed activation. Fatal when the caller named the env, advisory when we were
+# only falling back to the default — in that case find_snakemake reports the missing binary
+# in general terms, which is more useful than a conda error to someone who never mentioned
+# conda.
+activation_failed() {
+    local explicit=$1; shift
+    (( explicit )) && die "$*"
+    info "note: $*"
+    return 1
+}
+
+# Activation, so a plain `./run_munge.sh start` works in a fresh shell with no setup.
+#
+# Order of preference:
+#   1. SNAKEMAKE — an explicit binary path, nothing to activate.
+#   2. CONDA_ENV — activate exactly what the caller named (a name or a prefix path).
+#   3. snakemake already on PATH — you activated something yourself, so stay out of the way.
+#   4. DEFAULT_CONDA_ENV — the project's env, activated on your behalf.
+#
+# 3 before 4 is what keeps the default from being intrusive: it only ever fires when the run
+# would otherwise fail outright, so it cannot silently swap out an interpreter you chose.
 #
 # `conda activate` is a shell function that conda's hook defines, and non-interactive bash
 # never sources ~/.bashrc, so the hook has to be sourced explicitly here.
@@ -111,39 +132,60 @@ apply_caps() {
 # This must run in the current shell rather than a command substitution: the PATH and
 # CONDA_PREFIX it exports have to be inherited by the driver cmd_start launches.
 activate_conda_env() {
-    [[ -n "${CONDA_ENV:-}" ]] || return 0
-
     if [[ -n "${SNAKEMAKE:-}" ]]; then
-        info "note: SNAKEMAKE is set, so CONDA_ENV=$CONDA_ENV is ignored."
+        [[ -n "${CONDA_ENV:-}" ]] \
+            && info "note: SNAKEMAKE is set, so CONDA_ENV=$CONDA_ENV is ignored."
         return 0
     fi
 
+    local env explicit=1
+    env="${CONDA_ENV:-}"
+    if [[ -z "$env" ]]; then
+        command -v snakemake >/dev/null 2>&1 && return 0
+        env="$DEFAULT_CONDA_ENV"
+        explicit=0
+    fi
+
     # Already active — re-activating would only stack a second layer of the same env.
-    [[ "${CONDA_DEFAULT_ENV:-}" == "$CONDA_ENV" ]] && return 0
+    [[ "${CONDA_DEFAULT_ENV:-}" == "$env" ]] && return 0
 
     local conda_exe base hook
     conda_exe="${CONDA_EXE:-$(command -v conda || true)}"
     [[ -n "$conda_exe" && -x "$conda_exe" ]] \
-        || die "CONDA_ENV=$CONDA_ENV is set but no conda binary was found.
+        || activation_failed $explicit "no conda binary was found, so '$env' cannot be activated.
   Set CONDA_EXE=/path/to/bin/conda, or skip conda entirely:
-  SNAKEMAKE=/path/to/envs/$CONDA_ENV/bin/snakemake $0 $*"
+  SNAKEMAKE=/path/to/envs/$env/bin/snakemake $0 <subcommand>" || return 0
 
     base=$("$conda_exe" info --base) \
-        || die "'$conda_exe info --base' failed, so conda's shell hook cannot be located"
+        || activation_failed $explicit "'$conda_exe info --base' failed, so conda's shell hook cannot be located" \
+        || return 0
     hook="$base/etc/profile.d/conda.sh"
-    [[ -r "$hook" ]] || die "conda's shell hook is not readable at $hook"
+    [[ -r "$hook" ]] \
+        || activation_failed $explicit "conda's shell hook is not readable at $hook" || return 0
 
     # conda's hook and activation scripts are not written for strict mode: they dereference
     # unset variables, which aborts under the set -u at the top of this file. Both flags go
     # off for the duration and back on immediately after.
     set +eu
     # shellcheck source=/dev/null
-    source "$hook" || { set -eu; die "failed to source conda's shell hook at $hook"; }
-    conda activate "$CONDA_ENV" \
-        || { set -eu; die "'conda activate $CONDA_ENV' failed. List the names with '$conda_exe env list'."; }
+    source "$hook" || {
+        set -eu
+        activation_failed $explicit "failed to source conda's shell hook at $hook" || return 0
+    }
+    # A name only resolves if the env sits in one of this installation's envs_dirs, so an env
+    # belonging to a second conda install shows up in `conda info --envs` as a bare path with
+    # no name and cannot be activated by name. CONDA_ENV takes a prefix path too, which is
+    # the way out of that: conda activate accepts either form.
+    conda activate "$env" || {
+        set -eu
+        activation_failed $explicit "'conda activate $env' failed (conda base: $base).
+  Check the name against '$conda_exe info --envs'. Envs listed there without a name live
+  outside this install's envs_dirs and only activate by full path — pass that instead:
+  CONDA_ENV=/full/path/to/envs/<env> $0 <subcommand>" || return 0
+    }
     set -eu
 
-    info "conda env:  $CONDA_ENV"
+    info "conda env:  $env"
 }
 
 find_snakemake() {
@@ -156,10 +198,12 @@ find_snakemake() {
         command -v snakemake
         return
     fi
-    die "snakemake not found on PATH.
-  Activate the environment first (conda activate bri-snakemake),
-  have this script do it (CONDA_ENV=bri-snakemake $0 $*),
-  or point at the binary directly: SNAKEMAKE=/path/to/bin/snakemake $0 $*"
+    die "snakemake not found on PATH, and activating '$DEFAULT_CONDA_ENV' did not provide it
+  (any reason why is noted above). Check that the env exists and has snakemake installed:
+    conda info --envs
+    ls \$CONDA_PREFIX/bin/snakemake
+  Then name a different env (CONDA_ENV=<name|path> $0 <subcommand>) or point at the
+  binary directly (SNAKEMAKE=/path/to/bin/snakemake $0 <subcommand>)."
 }
 
 # The k8s executor plugin ignores the Snakefile's container: directive and needs the image
@@ -376,7 +420,7 @@ cmd_unlock() {
 }
 
 usage() {
-    sed -n '3,36p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '3,37p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 case "${1:-}" in

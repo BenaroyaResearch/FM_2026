@@ -92,8 +92,6 @@ Before launching: run `./setup_renv.sh` once (above), list the GCST IDs you want
 `config/study_table.tsv`.
 
 ```bash
-conda activate bri-snakemake      # or: export SNAKEMAKE=/path/to/bin/snakemake
-
 ./run_munge.sh dryrun             # check the DAG and library discovery, creates no pods
 ./run_munge.sh start              # launch detached
 ./run_munge.sh log                # follow the live log
@@ -118,20 +116,38 @@ Environment overrides: `SNAKEMAKE` (binary path), `CONDA_ENV` (env to activate f
 below), `PROFILE` (default `coder`), `IMAGE` (default: the `container:` key in
 `config/config_munge.yaml`).
 
-#### Letting the wrapper activate the env
+#### Which snakemake it uses
 
-The wrapper does not activate conda for you by default — it looks for `SNAKEMAKE`, then for
-`snakemake` on `PATH`. For a fresh shell or a cron entry, `CONDA_ENV` makes it do the
-activation itself:
+No activation step is needed: if `snakemake` is not already available, the wrapper activates
+`bri-snakemake` itself. It picks an interpreter in this order, and the first hit wins.
+
+| Order | Source | When |
+|---|---|---|
+| 1 | `SNAKEMAKE` | set — an explicit binary path, no activation happens |
+| 2 | `CONDA_ENV` | set — activates exactly that env (a name or a full prefix path) |
+| 3 | `snakemake` on `PATH` | you already activated something; the wrapper leaves it alone |
+| 4 | `bri-snakemake` | nothing else resolved, so the project's env is activated for you |
+
+Step 3 sits ahead of step 4 deliberately: the default only fires when the run would fail
+anyway, so it can never silently swap out an env you chose yourself. If you have a different
+env active, that is what runs. Override the default name with `DEFAULT_CONDA_ENV` if the env
+is called something else in your setup.
+
+Activating for step 2 or 4 means sourcing conda's shell hook first, because `conda activate`
+is a shell function and non-interactive bash never reads `~/.bashrc`. Set `CONDA_EXE` as well
+if `conda` is not on `PATH`. A failure to activate is fatal when you named the env yourself,
+and only a warning when the wrapper was falling back to the default — in that case the
+"snakemake not found" error reports the real problem.
+
+`CONDA_ENV` accepts a full prefix path as well as a name, which is what you need when more
+than one conda is installed. A name only resolves if the env is inside the active install's
+`envs_dirs`; `conda info --envs` prints such envs with a name and everything else as a bare
+path. If yours is listed without a name, pass the path — or bypass conda with `SNAKEMAKE`:
 
 ```bash
-CONDA_ENV=bri-snakemake ./run_munge.sh start
+CONDA_ENV=/home/<you>/miniforge3/envs/bri-snakemake ./run_munge.sh start
+SNAKEMAKE=/home/<you>/miniforge3/envs/bri-snakemake/bin/snakemake ./run_munge.sh start
 ```
-
-It sources conda's shell hook before activating, because `conda activate` is a shell
-function and non-interactive bash never reads `~/.bashrc`. Set `CONDA_EXE` as well if
-`conda` is not on `PATH`. `SNAKEMAKE` takes precedence when both are set, and the script
-says so rather than activating silently.
 
 Activation is only needed at launch. `start` resolves the binary to an absolute path before
 `nohup`ing it, so the detached driver keeps running after you close the terminal or
