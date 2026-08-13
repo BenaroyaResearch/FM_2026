@@ -151,7 +151,9 @@ verify() {
 
     info ""
     info "Library is ready. Confirm the Snakefile discovers it with:"
-    info "    ./run_munge.sh dryrun | head -2"
+    # Not 'head': it closes the pipe early and snakemake turns that into a BrokenPipeError
+    # traceback instead of exiting quietly. grep reads the stream to the end.
+    info "    ./run_munge.sh dryrun 2>&1 | grep 'Reference package library:'"
     return 0
 }
 

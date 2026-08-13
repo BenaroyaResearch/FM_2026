@@ -43,10 +43,16 @@ Verifying reference library:
 Then confirm the Snakefile discovers the same path:
 
 ```bash
-./run_munge.sh dryrun | head -2
+./run_munge.sh dryrun 2>&1 | grep -E 'Running [0-9]+ studies:|Reference package library:'
 # Running 1 studies: ['GCST90132226']
 # Reference package library: /home/<you>/FM_2026/renv/library/linux-ubuntu-noble/R-4.4/x86_64-pc-linux-gnu
 ```
+
+Do not pipe a dryrun through `head`. It exits after its line count and closes the pipe, and
+because Python ignores `SIGPIPE`, snakemake raises `BrokenPipeError` from inside its logger
+and buries the output you wanted in two tracebacks. `grep` and `sed -n '1,20p'` read to the
+end of the stream, so they are safe. The `2>&1` matters too: snakemake logs to stderr, so an
+unredirected pipe sees only part of the output.
 
 #### What it does, and what it catches
 
