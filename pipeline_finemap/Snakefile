@@ -1,0 +1,694 @@
+import pandas as pd
+import sys, os
+
+workdir: "../"
+
+# Adds shared folder (folder used for both pipelines) to Python's search path so Snakefile always
+# has access. Two helper functions used by both munge and finemap pipelines (load_study_info) and
+# resolve_ref_lib).
+sys.path.insert(0, os.path.join(os.path.dirname(workflow.basedir), "shared"))
+from load_study_info import load_study_info
+from resolve_ref_lib import resolve_ref_lib
+
+# Filters study_table.tsv to studies listed in config_munge.yaml
+configfile: "config/config_finemap.yaml"
+study_info = load_study_info(config) # Reads study_table.tsv and filters down to studies listed in config. Returns dict keyed by study name.
+FINEMAPPING_METHOD = config["finemapping_method"] # Pulls finemapping_method
+
+# Figures out which SNPlocs Bioconductor package (GRCh37 vs GRCh38 dbSNP build) to use
+# Needed later by get_associations to validate lead SNP positions
+ref_lib = resolve_ref_lib(config)
+
+# config.get() returns a real bool when set in the YAML, but a plain string when overridden via
+# --config on the command line (where "false" is truthy) — normalize both.
+RESCUE_MISSING_LD_NEIGHBORS = str(config.get("rescue_missing_ld_neighbors", False)).strip().lower() not in ("false", "0", "no", "")
+
+# Prefixes only the locus-window-dependent rules' outputs (subset_gwas_locus,
+# subset_1000g_and_plink, ld_matrix_and_freq, align_gwas_bim, run_susie), so a
+# --config locus_output_root=... run can test an alternate locus_window_bp into its own
+# directory tree without touching or re-deriving any of a study's real results. Defaults to
+# "results", which is byte-identical to every path before this existed.
+LOCUS_OUT_ROOT = config.get("locus_output_root", "results")
+
+# Locus-window size (config["locus_window_bp"]), baked into the path structure so +/-500kb and
+# +/-300kb (etc.) results coexist as separate, permanent result sets rather than one overwriting
+# the other. Nests *within* LOCUS_OUT_ROOT, not instead of it -- the two are orthogonal
+# (LOCUS_OUT_ROOT picks which top-level tree; WINDOW_LABEL picks the window-size subfolder within
+# it), so a real run at any window size now organizes itself correctly under results/ on its own;
+# a true one-off sandbox (a wholly separate LOCUS_OUT_ROOT) still works independently of this.
+WINDOW_LABEL = f"{config['locus_window_bp'] // 1000}kb_window"
+
+print(f"Running {len(study_info)} studies: {list(study_info.keys())}")
+
+# Refreshes susie_fm_status/fm_pipeline_run_status.{tsv,csv} whenever a run ends, whether it
+# succeeded or not. The table reports every method/window found under this run's output root,
+# so this run's window is included alongside earlier ones. Snakemake skips these hooks on dry
+# runs and with --no-hooks; is_main_process keeps them to the driver, since a job run in its own
+# process (e.g. a remote executor) re-parses this Snakefile and would otherwise refresh too.
+# A failed refresh is only reported; it never changes the run's outcome.
+def refresh_fm_status():
+    import subprocess
+    if not workflow.is_main_process:
+        return
+    cmd = [sys.executable, "susie_fm_status/build_fm_status_table.py",
+           "--results-root", LOCUS_OUT_ROOT,
+           "--finished-run", "finemap"]
+    try:
+        subprocess.run(cmd, check=True)
+    except Exception as e:
+        print(f"WARNING: fine-mapping status table refresh failed: {e}", file=sys.stderr)
+
+onsuccess:
+    refresh_fm_status()
+
+onerror:
+    refresh_fm_status()
+
+# Pipeline ultimately needs to produce:
+#      1. txt file indicating fm has been completed ("study finalized" marker)
+#      2. table of all SNPs in GWAS sum stats and their FM info
+#      3. final report summarizing study/association fine mapping info
+#      4. summary of general alignment with OT and top PIP disagreements
+#      5. summary of each locus and it's r2 value with OT
+#      6. mahattan plots done marker
+
+rule all:
+    input:
+        expand("results/{study}/checking/" + FINEMAPPING_METHOD + "/" + WINDOW_LABEL + "/study_finalized.txt", study=study_info.keys()),
+        expand("results/{study}/checking/" + FINEMAPPING_METHOD + "/" + WINDOW_LABEL + "/{study}_snps_table.tsv", study=study_info.keys()),
+        expand("results/{study}/checking/" + FINEMAPPING_METHOD + "/" + WINDOW_LABEL + "/{study}_final_report.txt", study=study_info.keys()),
+        expand("results/{study}/checking/" + FINEMAPPING_METHOD + "/" + WINDOW_LABEL + "/{study}_alignment_summary.txt", study=study_info.keys()),
+        expand("results/{study}/checking/" + FINEMAPPING_METHOD + "/" + WINDOW_LABEL + "/{study}_locus_r2_summary.txt", study=study_info.keys()),
+        expand("results/{study}/" + WINDOW_LABEL + "/manhattan_plots_done.txt", study=study_info.keys())
+
+# Purpose: creates associations table for a study's lead SNPs from study_table.tsv, build-checking
+# each rsID's CHR:BP against dbSNP (GRCh37 and GRCh38) and converting to GRCh38 if it was GRCh37.
+# Prevents pipeline from breaking if associations are listed as CHR:BP instead of rsid.
+# Loading SNPlocs.Hsapiens.dbSNP155.GRCh37/GRCh38 pulls in a good deal of Bioconductor machinery
+# (GenomicRanges/BSgenome/Biostrings/DelayedArray/SummarizedExperiment) per job; snplocs_slots
+# throttles how many of these run at once so a large --cores value can't load all of that
+# concurrently and blow past this workspace's shared memory cgroup (there is no Kubernetes/
+# container profile on this Snakefile giving each job its own pod, unlike pipeline_munge).
+# Unconstrained unless the run supplies a ceiling with --resources snplocs_slots=N;
+# run_finemap.sh always does.
+
+# How this manages resources: snplocs_slots tells the job how many slots of get_associations it
+# takes up. Does not say how many slots there are, just that this job takes up one. run_finemap.sh
+# sets the max (N) at 2. No matter how many other jobs (--jobs 8 by default) are running, only
+# 2 get_associations jobs may run at a time.
+rule get_associations:
+    input:
+        decision = "results/{study}/munged/{study}_fm_decision.txt"
+    output:
+        "results/{study}/associations/{study}_lead_snps.tsv"
+    params:
+        lead_snps = lambda wildcards: study_info[wildcards.study]["lead_snps"],
+        lead_positions = lambda wildcards: study_info[wildcards.study]["lead_snp_positions"],
+        log_path = lambda wildcards: study_info[wildcards.study]["log_file"],
+        ref_lib = ref_lib,
+        chain_file = config["grch37_to_grch38_chain"]
+    resources:
+        snplocs_slots = 1
+    script:
+        "scripts/get_associations.R"
+
+# Purpose: gather association wildcards by first creating empty files (format that Snakemake can deal with)
+checkpoint gather_loci:
+    input:
+        "results/{study}/associations/{study}_lead_snps.tsv"
+    output:
+        directory("results/{study}/loci_pending")
+    shell:
+        r"""
+        mkdir -p {output}
+        tail -n +2 {input} | while read -r snp chr bp; do
+            touch {output}/${{snp}}.locus
+        done
+        """
+
+# Essentially allows Snakemake to discover new wildcard values at runtime instead of needing to know them in advance
+def get_loci(wildcards):
+    ck_output = checkpoints.gather_loci.get(**wildcards).output[0] # Run gather_loci checkpoint if you haven't already and give path to output directory
+    import glob, os
+    # return any files matching the pattern .locus and strip to rsids
+    return [os.path.basename(f).replace(".locus", "")
+            for f in glob.glob(f"{ck_output}/*.locus")]
+
+# Purpose: subsets the GWAS to +/- 500,000 bp around each association ** Potential for filter change
+# Reads the whole munged sumstats file into memory fresh for every locus of every study (there's
+# no way to share that read across loci given how this rule is structured), so a study with many
+# loci means many multi-GB R processes at once with no cap. subset_slots throttles concurrent
+# jobs for exactly that reason -- this rule, running unconstrained, is what pushed the workspace's
+# memory cgroup to its limit and got the whole pod OOM-killed. Unconstrained unless the run
+# supplies a ceiling with --resources subset_slots=N; run_finemap.sh always does.
+rule subset_gwas_locus:
+    input:
+        munged = "results/{study}/munged/{study}_munged.tsv.gz",
+        associations = "results/{study}/associations/{study}_lead_snps.tsv"
+    output:
+        f"{LOCUS_OUT_ROOT}/{{study}}/{{locus}}/{WINDOW_LABEL}/{{locus}}_gwas_subset.tsv"
+    params:
+        window_bp = config["locus_window_bp"],
+        log_path = lambda wildcards: study_info[wildcards.study]["log_file"]
+    resources:
+        subset_slots = 1
+    script:
+        "scripts/subset_gwas_locus.R"
+
+# Purpose: for one locus, subset the 1000 genomes reference panel to +/- window bp around lead SNP, restricted to ancestry-specific samples.
+rule subset_1000g_and_plink:
+    input:
+        associations = "results/{study}/associations/{study}_lead_snps.tsv"
+    output:
+        bed = f"{LOCUS_OUT_ROOT}/{{study}}/{{locus}}/{WINDOW_LABEL}/LD_block_check/{{locus}}.region.chrpos.bed",
+        bim = f"{LOCUS_OUT_ROOT}/{{study}}/{{locus}}/{WINDOW_LABEL}/LD_block_check/{{locus}}.region.chrpos.bim",
+        fam = f"{LOCUS_OUT_ROOT}/{{study}}/{{locus}}/{WINDOW_LABEL}/LD_block_check/{{locus}}.region.chrpos.fam"
+    params:
+        plink_dir = config["thousand_genomes_plink_dir"],
+        file_prefix = config.get("thousand_genomes_file_prefix", "1000g_hg38"),
+        sample_dir = config["thousand_genomes_sample_dir"],
+        ancestry = lambda wildcards: study_info[wildcards.study]["Ancestry"],
+        window_bp = config["locus_window_bp"],
+        log_path = lambda wildcards: study_info[wildcards.study]["log_file"]
+    shell:
+        r"""
+        # Ancestry-specific sample list and genotype panel
+        SAMPLE_FILE="{params.sample_dir}/{params.ancestry}.1000g.sample.ID.txt"
+        PLINK_PREFIX="{params.plink_dir}/{params.ancestry}/{params.file_prefix}_{params.ancestry}_chr"
+
+        if [ ! -s "$SAMPLE_FILE" ]; then
+            echo "$(date): ERROR - no 1000G reference panel available for ancestry {params.ancestry}. Cannot proceed with this study." >> {params.log_path}
+            exit 1
+        fi
+
+        if [ ! -f "${{PLINK_PREFIX}}1.bed" ]; then
+            echo "$(date): ERROR - no 1000G PLINK reference panel available for ancestry {params.ancestry} (expected ${{PLINK_PREFIX}}<chr>.bed). Cannot proceed with this study." >> {params.log_path}
+            exit 1
+        fi
+
+        # Extracts CHR:BP for matching later (where rsids may not always align)
+        LEAD_ROW=$(awk -v snp="{wildcards.locus}" '$1==snp' {input.associations})
+        CHR=$(echo "$LEAD_ROW" | cut -f2)
+        BP=$(echo "$LEAD_ROW" | cut -f3)
+        START=$((BP - {params.window_bp}))
+        # A lead SNP near the start of a chromosome can push the window below position 0,
+        # which plink's --from-bp rejects outright ("Invalid --from-bp parameter '-N'").
+        # Genomic coordinates are 1-based, so clamp to 1 rather than dropping the locus.
+        if [ "$START" -lt 1 ]; then
+            START=1
+        fi
+        END=$((BP + {params.window_bp}))
+
+        OUT_DIR={LOCUS_OUT_ROOT}/{wildcards.study}/{wildcards.locus}/{WINDOW_LABEL}/LD_block_check
+        mkdir -p "$OUT_DIR"
+
+        echo "$(date): locus {wildcards.locus} — subsetting hg38 1000G PLINK files chr$CHR:$START-$END (ancestry: {params.ancestry})" >> {params.log_path}
+
+        # Restricts 1000 genomes files to proper genomic window and samples
+        plink \
+            --bfile "${{PLINK_PREFIX}}${{CHR}}" \
+            --chr "$CHR" \
+            --from-bp "$START" \
+            --to-bp "$END" \
+            --make-bed \
+            --keep-fam "$SAMPLE_FILE" \
+            --out "$OUT_DIR/{wildcards.locus}.region"
+
+        # Overwrites rsid column of bim file to be CHR:BP
+        awk 'BEGIN{{OFS="\t"}} {{ $2 = $1 ":" $4; print }}' \
+            "$OUT_DIR/{wildcards.locus}.region.bim" > {output.bim}
+
+        mv "$OUT_DIR/{wildcards.locus}.region.fam" {output.fam}
+        mv "$OUT_DIR/{wildcards.locus}.region.bed" {output.bed}
+
+        echo "$(date): locus {wildcards.locus} — PLINK region extracted, bim renamed to chr:pos" >> {params.log_path}
+        """
+
+# Purpose: calculate LD between lead SNP and every variant nearby using 1000 genomes panel.
+# Outputs .ld file containing every SNP in high LD with lead SNP and their r2 values.
+rule compute_ld_r2:
+    input:
+        bed = f"{LOCUS_OUT_ROOT}/{{study}}/{{locus}}/{WINDOW_LABEL}/LD_block_check/{{locus}}.region.chrpos.bed",
+        bim = f"{LOCUS_OUT_ROOT}/{{study}}/{{locus}}/{WINDOW_LABEL}/LD_block_check/{{locus}}.region.chrpos.bim",
+        fam = f"{LOCUS_OUT_ROOT}/{{study}}/{{locus}}/{WINDOW_LABEL}/LD_block_check/{{locus}}.region.chrpos.fam",
+        associations = "results/{study}/associations/{study}_lead_snps.tsv"
+    output:
+        f"{LOCUS_OUT_ROOT}/{{study}}/{{locus}}/{WINDOW_LABEL}/LD_block_check/{{locus}}_1000g_0.6_ld_snps.ld"
+    params:
+        r2_threshold = config["ld_r2_threshold"], # Can change ld threshold from 0.6 in config file
+        window_kb = config["ld_window_kb"],
+        log_path = lambda wildcards: study_info[wildcards.study]["log_file"]
+    shell:
+        r"""
+
+        # Matching association to Snakemake current locus
+        LEAD_ROW=$(awk -v snp="{wildcards.locus}" '$1==snp' {input.associations})
+        CHR=$(echo "$LEAD_ROW" | cut -f2)
+        BP=$(echo "$LEAD_ROW" | cut -f3)
+
+        PREFIX={LOCUS_OUT_ROOT}/{wildcards.study}/{wildcards.locus}/{WINDOW_LABEL}/LD_block_check/{wildcards.locus}.region.chrpos
+
+        # Checking if lead SNP exists in 1000 genomes reference panel
+        if ! grep -qw "${{CHR}}:${{BP}}" "$PREFIX.bim"; then
+            echo "$(date): locus {wildcards.locus} — WARNING: lead SNP not found in 1000G reference panel at ${{CHR}}:${{BP}}, cannot compute LD" >> {params.log_path}
+            echo "LEAD_SNP_NOT_IN_REFERENCE" > {output}
+            exit 0
+        fi
+
+        # Compute r2 between the lead variant and every other SNP in the 1000 genomes subset,
+        # only reporting neighbors whose r2 is at or above threshold (0.6)
+        plink \
+            --bfile "$PREFIX" \
+            --r2 --ld-snp "${{CHR}}:${{BP}}" \
+            --ld-window-kb {params.window_kb} \
+            --ld-window 99999 \
+            --ld-window-r2 {params.r2_threshold} \
+            --out {LOCUS_OUT_ROOT}/{wildcards.study}/{wildcards.locus}/{WINDOW_LABEL}/LD_block_check/{wildcards.locus}_1000g_0.6_ld_snps # Update if choose to change ld threshold value
+
+        echo "$(date): locus {wildcards.locus} — LD r2 computed at threshold {params.r2_threshold}" >> {params.log_path}
+        """
+
+# Purpose: takes .ld file produced by the above and decides if any high-LD neighbors are missing from the subsetting summary stats
+# Flags loci based on presence of high LD neighbors, but continues FM anyway
+rule ld_neighbor_check:
+    input:
+        ld_file = f"{LOCUS_OUT_ROOT}/{{study}}/{{locus}}/{WINDOW_LABEL}/LD_block_check/{{locus}}_1000g_0.6_ld_snps.ld",
+        gwas_subset = f"{LOCUS_OUT_ROOT}/{{study}}/{{locus}}/{WINDOW_LABEL}/{{locus}}_gwas_subset.tsv",
+        bim = f"{LOCUS_OUT_ROOT}/{{study}}/{{locus}}/{WINDOW_LABEL}/LD_block_check/{{locus}}.region.chrpos.bim"
+    output:
+        f"{LOCUS_OUT_ROOT}/{{study}}/{{locus}}/{WINDOW_LABEL}/LD_block_check/{{locus}}_ld_check.txt"
+    params:
+        log_path = lambda wildcards: study_info[wildcards.study]["log_file"]
+    script:
+        "scripts/ld_neighbor_check.R"
+
+# Purpose: finds every munge-pipeline "cut SNP" side file for a study — any .tsv.gz in its
+# munged/ folder other than the final {study}_munged.tsv.gz (e.g. snp_strand_ambiguous.tsv.gz,
+# alleles_dont_match_ref_gen.tsv.gz). These are produced by pipeline_munge, not this Snakefile,
+# so this only ever globs pre-existing files rather than triggering a build.
+def get_cut_snp_files(wildcards):
+    import glob, os
+    munge_dir = f"results/{wildcards.study}/munged"
+    main_file = f"{wildcards.study}_munged.tsv.gz"
+    return sorted(
+        f for f in glob.glob(f"{munge_dir}/*.tsv.gz")
+        if os.path.basename(f) != main_file
+    )
+
+# Purpose: single toggle point for whether ld_matrix_and_freq/align_gwas_bim consume the raw
+# GWAS subset or the rescued one. Flipping rescue_missing_ld_neighbors in the config is enough
+# to fully exclude the rescue step: with it off, the rescue rule is never requested and never runs.
+def locus_gwas_subset_path(wildcards):
+    if RESCUE_MISSING_LD_NEIGHBORS:
+        return f"{LOCUS_OUT_ROOT}/{wildcards.study}/{wildcards.locus}/{WINDOW_LABEL}/{wildcards.locus}_gwas_subset_rescued.tsv"
+    return f"{LOCUS_OUT_ROOT}/{wildcards.study}/{wildcards.locus}/{WINDOW_LABEL}/{wildcards.locus}_gwas_subset.tsv"
+
+# Purpose: single toggle point for whether locus_summary reports a rescued-SNP count. With
+# rescuing off, rule rescue_missing_ld_neighbors never runs and this file never exists.
+def rescued_snps_path(wildcards):
+    if RESCUE_MISSING_LD_NEIGHBORS:
+        return f"{LOCUS_OUT_ROOT}/{wildcards.study}/{wildcards.locus}/{WINDOW_LABEL}/{wildcards.locus}_rescued_snps.tsv"
+    return []
+
+# Purpose: OPTIONAL safety-net step (toggle: config["rescue_missing_ld_neighbors"]). For high-LD
+# neighbors of the lead SNP that were dropped from the GWAS subset during munging QC (e.g. strand
+# ambiguity, allele mismatch with reference), checks whether that exact CHR:BP survived in one of
+# the munge pipeline's cut-SNP side files, and if so splices it back into the subset used to build
+# the LD matrix. Matches on CHR:BP only — never invents data, only recovers rows the munge pipeline
+# already produced. Recovered SNPs get their LD to the lead SNP the same way every other SNP in the
+# subset does: automatically, once ld_matrix_and_freq builds the LD matrix from the enlarged subset.
+# Reuses subset_gwas_locus's subset_slots pool: get_cut_snp_files reads every study-level munge
+# cut-SNP file fresh per locus (same shape of cost as subset_gwas_locus reading the whole munged
+# file per locus), so this is dormant-but-defensive -- currently inert since
+# rescue_missing_ld_neighbors defaults to false, but capped now so turning it on later can't
+# reintroduce the same unthrottled-per-locus-fan-out OOM risk by surprise.
+rule rescue_missing_ld_neighbors:
+    input:
+        gwas_subset = f"{LOCUS_OUT_ROOT}/{{study}}/{{locus}}/{WINDOW_LABEL}/{{locus}}_gwas_subset.tsv",
+        ld_check = f"{LOCUS_OUT_ROOT}/{{study}}/{{locus}}/{WINDOW_LABEL}/LD_block_check/{{locus}}_ld_check.txt",
+        cut_files = get_cut_snp_files,
+        bim = f"{LOCUS_OUT_ROOT}/{{study}}/{{locus}}/{WINDOW_LABEL}/LD_block_check/{{locus}}.region.chrpos.bim"
+    output:
+        gwas_subset_rescued = f"{LOCUS_OUT_ROOT}/{{study}}/{{locus}}/{WINDOW_LABEL}/{{locus}}_gwas_subset_rescued.tsv",
+        rescued_snps_report = f"{LOCUS_OUT_ROOT}/{{study}}/{{locus}}/{WINDOW_LABEL}/{{locus}}_rescued_snps.tsv"
+    params:
+        log_path = lambda wildcards: study_info[wildcards.study]["log_file"]
+    resources:
+        subset_slots = 1
+    script:
+        "scripts/rescue_missing_ld_neighbors.R"
+
+# Purpose: Pulls LD flag value for each locus and puts into table {study}_ld_flags.tsv. Used to filter eligible FM loci.
+rule build_ld_flag_table:
+    input:
+        associations = "results/{study}/associations/{study}_lead_snps.tsv",
+        ld_checks = lambda wildcards: expand(
+            f"{LOCUS_OUT_ROOT}/{{{{study}}}}/{{locus}}/{WINDOW_LABEL}/LD_block_check/{{locus}}_ld_check.txt",
+            locus=get_loci(wildcards)
+        )
+    output:
+        f"{LOCUS_OUT_ROOT}/{{study}}/associations/{WINDOW_LABEL}/{{study}}_ld_flags.tsv"
+    params:
+        log_path = lambda wildcards: study_info[wildcards.study]["log_file"]
+    script:
+        "scripts/build_ld_flag_table.R"
+
+
+# Purpose: reads LD flags and creates one marker file per locus that is eligible to proceed to fine mapping
+checkpoint filter_eligible_loci:
+    input:
+        f"{LOCUS_OUT_ROOT}/{{study}}/associations/{WINDOW_LABEL}/{{study}}_ld_flags.tsv"
+    output:
+        directory(f"{LOCUS_OUT_ROOT}/{{study}}/{WINDOW_LABEL}/loci_eligible")
+    shell:
+        r"""
+        mkdir -p {output}
+        # Produce marker file for each locus whose LD flag is neither NOT_IN_REFERENCE (lead SNP
+        # absent from the reference panel) nor CHECK_FAILED (the LD-neighbor check itself errored,
+        # so missing-neighbor status was never verified -- excluded rather than waved through).
+        # (Points to last column, so if ld_flags columns ever change, need to edit)
+        tail -n +2 {input} | awk -F'\t' '$NF != "NOT_IN_REFERENCE" && $NF != "CHECK_FAILED" {{print $1}}' | while read -r snp; do
+            touch {output}/${{snp}}.locus
+        done
+        """
+
+# Purpose: checkpoint used by ld_matrix_and_freq, align_gwas_bim, run_susie and aggregation rules to get loci that are worth fine-mapping
+def get_eligible_loci(wildcards):
+    ck_output = checkpoints.filter_eligible_loci.get(**wildcards).output[0]
+    import glob, os
+    return [os.path.basename(f).replace(".locus", "")
+            for f in glob.glob(f"{ck_output}/*.locus")]
+
+# Purpose: Takes the 1000G window subset and narrows it to the GWAS's exact positions, applying MAF (>0.01) and biallelic filters.
+# From that final set, builds the LD matrix, the SNP list matching its row/column order, and per-SNP allele frequencies.
+rule ld_matrix_and_freq:
+    input:
+        bed = f"{LOCUS_OUT_ROOT}/{{study}}/{{locus}}/{WINDOW_LABEL}/LD_block_check/{{locus}}.region.chrpos.bed",
+        bim = f"{LOCUS_OUT_ROOT}/{{study}}/{{locus}}/{WINDOW_LABEL}/LD_block_check/{{locus}}.region.chrpos.bim",
+        fam = f"{LOCUS_OUT_ROOT}/{{study}}/{{locus}}/{WINDOW_LABEL}/LD_block_check/{{locus}}.region.chrpos.fam",
+        gwas_subset = locus_gwas_subset_path
+    output:
+        matrix = f"{LOCUS_OUT_ROOT}/{{study}}/{{locus}}/{WINDOW_LABEL}/LD_matrix/{{locus}}.locus.matrix.ld",
+        snplist = f"{LOCUS_OUT_ROOT}/{{study}}/{{locus}}/{WINDOW_LABEL}/LD_matrix/{{locus}}.locus.matrix.snplist",
+        freq = f"{LOCUS_OUT_ROOT}/{{study}}/{{locus}}/{WINDOW_LABEL}/LD_matrix/{{locus}}.locus.frq",
+        bim = f"{LOCUS_OUT_ROOT}/{{study}}/{{locus}}/{WINDOW_LABEL}/LD_matrix/{{locus}}.locus.plink.bim"
+    params:
+        log_path = lambda wildcards: study_info[wildcards.study]["log_file"]
+    shell:
+        r"""
+        OUT_DIR={LOCUS_OUT_ROOT}/{wildcards.study}/{wildcards.locus}/{WINDOW_LABEL}
+        PREFIX={LOCUS_OUT_ROOT}/{wildcards.study}/{wildcards.locus}/{WINDOW_LABEL}/LD_block_check/{wildcards.locus}.region.chrpos
+
+        # Reads GWAS subset file, creating CHR:BP position list to know which exact positions to keep.
+        awk -F'\t' 'NR>1 {{print $2":"$3}}' {input.gwas_subset} > "$OUT_DIR/LD_matrix/{wildcards.locus}.extract_list.txt"
+
+        # Takes wider 1000g reference set and keeps only positions listed within extract file. Drops anything with minor allele frequency
+        # under 1%, drops mutli-allelic sites, and keeps allele order.
+        plink \
+            --bfile "$PREFIX" \
+            --extract "$OUT_DIR/LD_matrix/{wildcards.locus}.extract_list.txt" \
+            --maf 0.01 \
+            --biallelic-only \
+            --keep-allele-order \
+            --make-bed \
+            --out "$OUT_DIR/LD_matrix/{wildcards.locus}.locus.plink"
+
+        # Computes LD matrix. Writes SNP list with SNPs within the LD matrix.
+        plink \
+            --bfile "$OUT_DIR/LD_matrix/{wildcards.locus}.locus.plink" \
+            --r square \
+            --keep-allele-order \
+            --write-snplist \
+            --out "$OUT_DIR/LD_matrix/{wildcards.locus}.locus.matrix"
+
+        # Computes each SNPs allele frequency for MAF lookup used later when building final results table.
+        plink \
+            --bfile "$OUT_DIR/LD_matrix/{wildcards.locus}.locus.plink" \
+            --freq \
+            --out "$OUT_DIR/LD_matrix/{wildcards.locus}.locus"
+
+        echo "$(date): locus {wildcards.locus} — LD matrix and freq files built" >> {params.log_path}
+        """
+
+# Purpose: Makes sure GWAS data's row order exactly matches the LD matrix's row/column order.
+# Makes sure alleles are oriented the same way in both the X/
+rule align_gwas_bim:
+    input:
+        gwas_subset = locus_gwas_subset_path,
+        bim = f"{LOCUS_OUT_ROOT}/{{study}}/{{locus}}/{WINDOW_LABEL}/LD_matrix/{{locus}}.locus.plink.bim",
+        matrix = f"{LOCUS_OUT_ROOT}/{{study}}/{{locus}}/{WINDOW_LABEL}/LD_matrix/{{locus}}.locus.matrix.ld"
+    output:
+        f"{LOCUS_OUT_ROOT}/{{study}}/{{locus}}/{WINDOW_LABEL}/{{locus}}_gwas_subset_aligned.tsv"
+    params:
+        log_path = lambda wildcards: study_info[wildcards.study]["log_file"]
+    script:
+        "scripts/align_gwas_bim.R"
+
+# Purpose: produces the record of which loci got excluded from fine-mapping and why.
+# Combines LD neighbor flag with alignment outcome
+rule build_exclusions_table:
+    input:
+        associations = "results/{study}/associations/{study}_lead_snps.tsv",
+        ld_checks = lambda wildcards: expand(
+            LOCUS_OUT_ROOT + "/{{study}}/{locus}/" + WINDOW_LABEL + "/LD_block_check/{locus}_ld_check.txt",
+            locus=get_loci(wildcards)
+        ),
+        alignments = lambda wildcards: expand(
+            LOCUS_OUT_ROOT + "/{{study}}/{locus}/" + WINDOW_LABEL + "/{locus}_gwas_subset_aligned.tsv",
+            locus=get_eligible_loci(wildcards)
+        )
+    output:
+        f"{LOCUS_OUT_ROOT}/{{study}}/associations/{WINDOW_LABEL}/{{study}}_exclusions.tsv"
+    params:
+        log_path = lambda wildcards: study_info[wildcards.study]["log_file"]
+    script:
+        "scripts/build_exclusions_table.R"
+
+rule run_susie:
+    input:
+        aligned_gwas = f"{LOCUS_OUT_ROOT}/{{study}}/{{locus}}/{WINDOW_LABEL}/{{locus}}_gwas_subset_aligned.tsv",
+        matrix = f"{LOCUS_OUT_ROOT}/{{study}}/{{locus}}/{WINDOW_LABEL}/LD_matrix/{{locus}}.locus.matrix.ld",
+        snplist = f"{LOCUS_OUT_ROOT}/{{study}}/{{locus}}/{WINDOW_LABEL}/LD_matrix/{{locus}}.locus.matrix.snplist",
+        freq = f"{LOCUS_OUT_ROOT}/{{study}}/{{locus}}/{WINDOW_LABEL}/LD_matrix/{{locus}}.locus.frq"
+    output:
+        results = f"{LOCUS_OUT_ROOT}/{{study}}/{{locus}}/{WINDOW_LABEL}/{FINEMAPPING_METHOD}/{{locus}}_susie_results.tsv",
+        summary = f"{LOCUS_OUT_ROOT}/{{study}}/{{locus}}/{WINDOW_LABEL}/{FINEMAPPING_METHOD}/{{locus}}_susie_summary.txt",
+        plot = f"{LOCUS_OUT_ROOT}/{{study}}/{{locus}}/{WINDOW_LABEL}/{FINEMAPPING_METHOD}/{{locus}}_susie_plot.pdf",
+        lambda_plot = f"{LOCUS_OUT_ROOT}/{{study}}/{{locus}}/{WINDOW_LABEL}/{FINEMAPPING_METHOD}/{{locus}}_lambda_diagnostic.pdf"
+    params:
+        n = lambda wildcards: study_info[wildcards.study]["n"],
+        L = config["susie_max_causal"],
+        finemapping_method = config["finemapping_method"],
+        estimate_residual_variance = config["susie_unmappable_estimate_residual_variance"],
+        lambda_warn_threshold = config["lambda_warn_threshold"],
+        lambda_fail_threshold = config["lambda_fail_threshold"],
+        log_path = lambda wildcards: study_info[wildcards.study]["log_file"]
+    script:
+        "scripts/run_susie.R"
+
+rule build_reference_comparison:
+    input:
+        associations = "results/{study}/associations/{study}_lead_snps.tsv",
+        susie_results = lambda wildcards: expand(
+            LOCUS_OUT_ROOT + "/{{study}}/{locus}/" + WINDOW_LABEL + "/" + FINEMAPPING_METHOD + "/{locus}_susie_results.tsv",
+            locus=get_eligible_loci(wildcards)
+        )
+    output:
+        f"{LOCUS_OUT_ROOT}/{{study}}/associations/{FINEMAPPING_METHOD}/{WINDOW_LABEL}/{{study}}_reference_comparison.tsv"
+    params:
+        lead_variant_table = config["lead_variant_table"],
+        log_path = lambda wildcards: study_info[wildcards.study]["log_file"]
+    script:
+        "scripts/build_reference_comparison.R"
+
+rule build_opentargets_cache:
+    input:
+        study_table = "config/study_table.tsv"
+    output:
+        "results/checking/opentargets_gwas_native_cache.tsv"
+    params:
+        raw_table = config["opentargets_raw_table"]
+    script:
+        "scripts/build_opentargets_cache.R"
+
+rule subset_opentargets_native:
+    input:
+        cache = "results/checking/opentargets_gwas_native_cache.tsv"
+    output:
+        f"{LOCUS_OUT_ROOT}/{{study}}/checking/{WINDOW_LABEL}/{{study}}_opentargets_native.tsv"
+    script:
+        "scripts/subset_opentargets_native.R"
+
+rule build_opentargets_comparison:
+    input:
+        associations = "results/{study}/associations/{study}_lead_snps.tsv",
+        ot_native = f"{LOCUS_OUT_ROOT}/{{study}}/checking/{WINDOW_LABEL}/{{study}}_opentargets_native.tsv",
+        susie_results = lambda wildcards: expand(
+            LOCUS_OUT_ROOT + "/{{study}}/{locus}/" + WINDOW_LABEL + "/" + FINEMAPPING_METHOD + "/{locus}_susie_results.tsv",
+            locus=get_eligible_loci(wildcards)
+        )
+    output:
+        pip_full = f"{LOCUS_OUT_ROOT}/{{study}}/checking/{FINEMAPPING_METHOD}/{WINDOW_LABEL}/{{study}}_pip_full.tsv",
+        pip_matched_plot = f"{LOCUS_OUT_ROOT}/{{study}}/checking/{FINEMAPPING_METHOD}/{WINDOW_LABEL}/{{study}}_pip_matched.pdf",
+        pip_all_plot = f"{LOCUS_OUT_ROOT}/{{study}}/checking/{FINEMAPPING_METHOD}/{WINDOW_LABEL}/{{study}}_pip_all.pdf",
+        cs_level = f"{LOCUS_OUT_ROOT}/{{study}}/checking/{FINEMAPPING_METHOD}/{WINDOW_LABEL}/{{study}}_cs_alignment.tsv"
+    params:
+        cs_size_exclude_threshold = config["opentargets_cs_size_exclude_threshold"],
+        log_path = lambda wildcards: study_info[wildcards.study]["log_file"]
+    script:
+        "scripts/build_opentargets_comparison.R"
+
+# Purpose: LD-binned regional (Manhattan) plot for one locus, colored by r^2 to the locus's own
+# lead SNP. Reuses the same LD_matrix files run_susie already consumes -- no new PLINK step.
+rule build_manhattan_plot:
+    input:
+        susie_results = f"{LOCUS_OUT_ROOT}/{{study}}/{{locus}}/{WINDOW_LABEL}/{FINEMAPPING_METHOD}/{{locus}}_susie_results.tsv",
+        matrix = f"{LOCUS_OUT_ROOT}/{{study}}/{{locus}}/{WINDOW_LABEL}/LD_matrix/{{locus}}.locus.matrix.ld",
+        snplist = f"{LOCUS_OUT_ROOT}/{{study}}/{{locus}}/{WINDOW_LABEL}/LD_matrix/{{locus}}.locus.matrix.snplist",
+        associations = "results/{study}/associations/{study}_lead_snps.tsv"
+    output:
+        f"{LOCUS_OUT_ROOT}/{{study}}/{{locus}}/{WINDOW_LABEL}/{FINEMAPPING_METHOD}/{{locus}}_manhattan_plot.pdf"
+    params:
+        window_bp = config["locus_window_bp"],
+        log_path = lambda wildcards: study_info[wildcards.study]["log_file"]
+    script:
+        "scripts/build_manhattan_plot.R"
+
+# Purpose: pulls every eligible locus's manhattan plot into a single per-study marker so `rule
+# all` can depend on it without expanding over loci itself (same pattern as aggregate_ld_matrices).
+rule collect_manhattan_plots:
+    input:
+        lambda wildcards: expand(
+            LOCUS_OUT_ROOT + "/{{study}}/{locus}/" + WINDOW_LABEL + "/" + FINEMAPPING_METHOD + "/{locus}_manhattan_plot.pdf",
+            locus=get_eligible_loci(wildcards)
+        )
+    output:
+        f"{LOCUS_OUT_ROOT}/{{study}}/{WINDOW_LABEL}/manhattan_plots_done.txt"
+    shell:
+        "touch {output}"
+
+rule build_locus_pip_plots:
+    input:
+        pip_full = f"{LOCUS_OUT_ROOT}/{{study}}/checking/{FINEMAPPING_METHOD}/{WINDOW_LABEL}/{{study}}_pip_full.tsv"
+    output:
+        summary = f"{LOCUS_OUT_ROOT}/{{study}}/checking/{FINEMAPPING_METHOD}/{WINDOW_LABEL}/{{study}}_locus_r2_summary.txt"
+    params:
+        finemapping_method = FINEMAPPING_METHOD,
+        window_label = WINDOW_LABEL,
+        log_path = lambda wildcards: study_info[wildcards.study]["log_file"]
+    script:
+        "scripts/build_locus_pip_plots.R"
+
+rule build_opentargets_alignment_summary:
+    input:
+        pip_full = f"{LOCUS_OUT_ROOT}/{{study}}/checking/{FINEMAPPING_METHOD}/{WINDOW_LABEL}/{{study}}_pip_full.tsv",
+        cs_level = f"{LOCUS_OUT_ROOT}/{{study}}/checking/{FINEMAPPING_METHOD}/{WINDOW_LABEL}/{{study}}_cs_alignment.tsv"
+    output:
+        summary = f"{LOCUS_OUT_ROOT}/{{study}}/checking/{FINEMAPPING_METHOD}/{WINDOW_LABEL}/{{study}}_alignment_summary.txt"
+    params:
+        log_path = lambda wildcards: study_info[wildcards.study]["log_file"]
+    script:
+        "scripts/build_opentargets_alignment_summary.R"
+
+rule finalize_study:
+    input:
+        exclusions = f"{LOCUS_OUT_ROOT}/{{study}}/associations/{WINDOW_LABEL}/{{study}}_exclusions.tsv",
+        # Was hardcoded to a literal "results/..." path that silently mismatched
+        # build_opentargets_comparison's actual (LOCUS_OUT_ROOT-prefixed) output location --
+        # only ever matched because every real run to date used the default LOCUS_OUT_ROOT
+        # ("results"). Fixed to reference the same path build_opentargets_comparison declares.
+        pip_full = f"{LOCUS_OUT_ROOT}/{{study}}/checking/{FINEMAPPING_METHOD}/{WINDOW_LABEL}/{{study}}_pip_full.tsv",
+        summary_files = lambda wildcards: expand(
+            LOCUS_OUT_ROOT + "/{{study}}/{locus}/" + WINDOW_LABEL + "/" + FINEMAPPING_METHOD + "/{locus}_summary.txt",
+            locus=get_eligible_loci(wildcards)
+        ),
+        # Forces finalize_study to run last: without these, it has no ordering relationship
+        # to the rules that produce them, so it can't reliably report "here's everything
+        # that was written" in its completion manifest below.
+        final_report = f"{LOCUS_OUT_ROOT}/{{study}}/checking/{FINEMAPPING_METHOD}/{WINDOW_LABEL}/{{study}}_final_report.txt",
+        snps_table = f"{LOCUS_OUT_ROOT}/{{study}}/checking/{FINEMAPPING_METHOD}/{WINDOW_LABEL}/{{study}}_snps_table.tsv",
+        alignment_summary = f"{LOCUS_OUT_ROOT}/{{study}}/checking/{FINEMAPPING_METHOD}/{WINDOW_LABEL}/{{study}}_alignment_summary.txt",
+        locus_r2_summary = f"{LOCUS_OUT_ROOT}/{{study}}/checking/{FINEMAPPING_METHOD}/{WINDOW_LABEL}/{{study}}_locus_r2_summary.txt"
+    output:
+        f"{LOCUS_OUT_ROOT}/{{study}}/checking/{FINEMAPPING_METHOD}/{WINDOW_LABEL}/study_finalized.txt"
+    params:
+        log_path = lambda wildcards: study_info[wildcards.study]["log_file"]
+    script:
+        "scripts/finalize_study.R"
+
+rule locus_summary:
+    input:
+        ld_check = f"{LOCUS_OUT_ROOT}/{{study}}/{{locus}}/{WINDOW_LABEL}/LD_block_check/{{locus}}_ld_check.txt",
+        susie_summary = f"{LOCUS_OUT_ROOT}/{{study}}/{{locus}}/{WINDOW_LABEL}/{FINEMAPPING_METHOD}/{{locus}}_susie_summary.txt",
+        susie_results = f"{LOCUS_OUT_ROOT}/{{study}}/{{locus}}/{WINDOW_LABEL}/{FINEMAPPING_METHOD}/{{locus}}_susie_results.tsv",
+        pip_full = f"{LOCUS_OUT_ROOT}/{{study}}/checking/{FINEMAPPING_METHOD}/{WINDOW_LABEL}/{{study}}_pip_full.tsv",
+        rescued_snps = rescued_snps_path
+    output:
+        f"{LOCUS_OUT_ROOT}/{{study}}/{{locus}}/{WINDOW_LABEL}/{FINEMAPPING_METHOD}/{{locus}}_summary.txt"
+    params:
+        log_path = lambda wildcards: study_info[wildcards.study]["log_file"]
+    script:
+        "scripts/locus_summary.R"
+
+rule build_snps_table:
+    input:
+        associations = "results/{study}/associations/{study}_lead_snps.tsv",
+        susie_results = lambda wildcards: expand(
+            LOCUS_OUT_ROOT + "/{{study}}/{locus}/" + WINDOW_LABEL + "/" + FINEMAPPING_METHOD + "/{locus}_susie_results.tsv",
+            locus=get_eligible_loci(wildcards)
+        )
+    output:
+        f"{LOCUS_OUT_ROOT}/{{study}}/checking/{FINEMAPPING_METHOD}/{WINDOW_LABEL}/{{study}}_snps_table.tsv"
+    params:
+        trait = lambda wildcards: study_info[wildcards.study]["Trait"],
+        window_bp = config["locus_window_bp"]
+    script:
+        "scripts/build_snps_table.R"
+
+rule build_final_report:
+    input:
+        associations = "results/{study}/associations/{study}_lead_snps.tsv",
+        exclusions = f"{LOCUS_OUT_ROOT}/{{study}}/associations/{WINDOW_LABEL}/{{study}}_exclusions.tsv",
+        summary_files = lambda wildcards: expand(
+            LOCUS_OUT_ROOT + "/{{study}}/{locus}/" + WINDOW_LABEL + "/" + FINEMAPPING_METHOD + "/{locus}_summary.txt",
+            locus=get_eligible_loci(wildcards)
+        ),
+        susie_results = lambda wildcards: expand(
+            LOCUS_OUT_ROOT + "/{{study}}/{locus}/" + WINDOW_LABEL + "/" + FINEMAPPING_METHOD + "/{locus}_susie_results.tsv",
+            locus=get_eligible_loci(wildcards)
+        ),
+        susie_summary = lambda wildcards: expand(
+            LOCUS_OUT_ROOT + "/{{study}}/{locus}/" + WINDOW_LABEL + "/" + FINEMAPPING_METHOD + "/{locus}_susie_summary.txt",
+            locus=get_eligible_loci(wildcards)
+        ),
+        raw_sumstats = "results/{study}/raw/{study}_sumstats.tsv.gz",
+        munged_sumstats = "results/{study}/munged/{study}_munged.tsv.gz"
+    output:
+        f"{LOCUS_OUT_ROOT}/{{study}}/checking/{FINEMAPPING_METHOD}/{WINDOW_LABEL}/{{study}}_final_report.txt"
+    params:
+        log_path = lambda wildcards: study_info[wildcards.study]["log_file"]
+    script:
+        "scripts/build_final_report.R"
+
+rule aggregate_ld_matrices:
+    input:
+        lambda wildcards: expand(
+            LOCUS_OUT_ROOT + "/{{study}}/{locus}/" + WINDOW_LABEL + "/LD_matrix/{locus}.locus.matrix.ld",
+            locus=get_eligible_loci(wildcards)
+        )
+    output:
+        f"{LOCUS_OUT_ROOT}/{{study}}/{WINDOW_LABEL}/ld_matrix_done.txt"
+    shell:
+        "touch {output}"
+
+
+rule aggregate_susie_results:
+    input:
+        lambda wildcards: expand(
+            LOCUS_OUT_ROOT + "/{{study}}/{locus}/" + WINDOW_LABEL + "/" + FINEMAPPING_METHOD + "/{locus}_susie_summary.txt",
+            locus=get_eligible_loci(wildcards)
+        )
+    output:
+        f"{LOCUS_OUT_ROOT}/{{study}}/{WINDOW_LABEL}/susie_done.txt"
+    shell:
+        "touch {output}"
