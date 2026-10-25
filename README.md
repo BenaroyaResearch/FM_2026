@@ -519,7 +519,7 @@ Earlier 300 kb test results from September, made on the wrong panels, were moved
 7. **Fine-map:** `./run_finemap.sh dryrun`, then `./run_finemap.sh start`.
 8. **Read the results.** Start with each study's final report
    (`results/{study}/checking/susieR/{window}/{study}_final_report.txt`) — see
-   [Your final files, explained](#your-final-files-explained).
+   [Final files, explained](#final-files-explained).
 
 To see where every study stands, open `susie_fm_status/fm_pipeline_run_status.tsv` (or the
 `.csv`). Steps 4 and 7 each refresh it automatically when the run ends; to refresh it at any
@@ -814,8 +814,8 @@ Open Targets.
 `config/config_finemap.yaml`, `config/study_table.tsv` (the lead SNPs and ancestry), and the
 reference files from setup.
 
-**Outputs:** see [Where everything ends up](#where-everything-ends-up) and
-[Your final files, explained](#your-final-files-explained).
+**Outputs:** see [File tree map](#file-tree-map) and
+[Final files, explained](#final-files-explained).
 
 **How it works, in plain terms.** Each lead SNP defines a **locus** (region): the lead SNP
 plus `locus_window_bp` bases either side. For each locus the pipeline:
