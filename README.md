@@ -39,8 +39,6 @@ study list  ──►  munge pipeline (run_munge.sh)  ──►  fine-mapping pi
   summaries for every region, Open Targets comparison tables and plots, and a log of every
   step.
 
-Words in **bold** that may be unfamiliar are explained in the [Glossary](#glossary) at the end.
-
 ### Contents
 
 1. [Setup: R reference library (renv)](#setup-r-reference-library-renv)
@@ -55,7 +53,6 @@ Words in **bold** that may be unfamiliar are explained in the [Glossary](#glossa
 10. [File tree map](#file-tree-map)
 11. [Final files, explained](#final-files-explained)
 12. [Known issues and ideas](#known-issues-and-ideas)
-13. [Glossary](#glossary)
 
 ## Setup: R reference library (renv)
 
@@ -1194,7 +1191,7 @@ The same columns as above (with `A1`/`A2` for the alleles), plus four QC columns
 | `SNPS_RESCUED` | Partners added back by the optional rescue step |
 | `N_CREDIBLE_SETS`, `CS_SIZES` | How many credible sets SuSiE found and their sizes (e.g. `L1=2`) |
 | `N_SNPS_PIP_APPROX_1`, `SNPS_PIP_APPROX_1` | SNPs with PIP ≈ 1. Occasionally real, but several at one locus often signal a problem. |
-| `LAMBDA` | Agreement between GWAS and reference LD (lower is better; see the glossary) |
+| `LAMBDA` | Agreement between GWAS and reference LD (near 0 is good; high values mean the reference panel doesn't match the study well) |
 | `PCT_SNPS_FAILING_QC`, `N_RED_SNPS`, `RED_SNPS` | Outlier ("red") SNPs from the outlier check |
 | `R2_VS_OPENTARGETS` | How well our PIPs agree with Open Targets' at this locus (needs ≥ 3 shared SNPs) |
 | Four `..._HIGH_PIP_...` counts | SNPs one side calls high-PIP (> 0.9) but the other calls low or doesn't have at all |
@@ -1278,30 +1275,3 @@ PICS for older studies). Close agreement is reassuring; big differences are wort
 - **Ideas:** run the munge pipeline from inside the fine-mapping pipeline for a fully hands-off
   run; switch on the lead-variant
   library comparison (`build_reference_comparison`).
-
-
-## Glossary
-
-| Term | Meaning |
-|---|---|
-| **GWAS** | Genome-wide association study: tests millions of SNPs for association with a trait. |
-| **Summary statistics (sumstats)** | A GWAS's per-SNP results (position, alleles, effect size, standard error, p-value), without individual-level data. |
-| **SNP** | A single-letter DNA difference between people. **rsID** = its dbSNP name (e.g. `rs10486567`). |
-| **Lead SNP / association** | The most significant SNP at a GWAS signal, as reported by the study. |
-| **Locus** | The window of the genome around one lead SNP that gets fine-mapped. |
-| **LD (linkage disequilibrium)** | SNPs near each other tend to be inherited together, so their GWAS results are correlated. **r²** measures this from 0 (independent) to 1 (always inherited together). |
-| **LD matrix** | A table of the correlation between every pair of SNPs in a locus. |
-| **Reference panel** | Genotypes of real people (here, 1000 Genomes) used to estimate LD, since GWAS summary statistics don't contain it. |
-| **Fine-mapping** | Statistically narrowing a GWAS signal down to the SNPs most likely to be causal. |
-| **SuSiE** | The fine-mapping method used here (R package susieR). It can find several independent signals in one locus. |
-| **PIP** | Posterior inclusion probability: the estimated chance (0–1) that a SNP is causal. |
-| **Credible set** | A small group of SNPs that together have a 95% chance of containing a causal SNP. Smaller sets are more precise. |
-| **Lambda** | A score for how well the GWAS results agree with the reference LD. Near 0 is good; high values mean the reference doesn't match the study well, so results are less reliable. |
-| **Outlier ("red") SNP** | A SNP whose GWAS result disagrees with what its LD with neighbouring SNPs predicts. |
-| **Genome build (GRCh37 / GRCh38)** | Versions of the human reference genome; the same SNP has different positions in each. Also called hg19 / hg38. Everything here is converted to GRCh38. |
-| **liftOver** | Converting positions from one genome build to another. |
-| **Harmonised file** | The GWAS Catalog's own cleaned-up version of a study's summary statistics. |
-| **Munging** | Cleaning summary statistics into one standard format (here with MungeSumstats). |
-| **Open Targets** | A public resource that fine-maps GWAS Catalog studies; used here as a comparison. |
-| **Snakemake** | The workflow tool that runs each step in order and only re-runs what's needed. |
-| **GCST ID** | A GWAS Catalog study accession, e.g. `GCST90476277`. |
