@@ -1,6 +1,6 @@
-# FM_2026: automated GWAS fine-mapping
+# FM_2026: automated GWAS fine-mapping with SuSiE
 
-## What this does
+## Purpose
 
 A genome-wide association study (GWAS) finds regions of the genome linked to a disease, but each
 region usually holds dozens to thousands of SNPs that are inherited together (they are in
@@ -30,11 +30,11 @@ study list  ──►  munge pipeline (run_munge.sh)  ──►  fine-mapping pi
 ```
 
 - **Munge pipeline** (`pipeline_munge/`): downloads each study's summary statistics, checks
-  they contain what fine-mapping needs, converts them to a standard format on genome build
-  GRCh38, and decides whether the study can be fine-mapped.
-- **Fine-mapping pipeline** (`pipeline_finemap/`): for every lead SNP, cuts out a window of
-  the genome, builds the matching LD from 1000 Genomes, fine-maps it with SuSiE, checks the
-  result, and compares it with Open Targets.
+  they contain the data required for fine-mapping, converts them to a standard format on genome build
+  GRCh38, and consults parameters to decide if the study can be fine-mapped.
+- **Fine-mapping pipeline** (`pipeline_finemap/`): for every lead SNP, subsets a window of
+  the genome, builds the matching LD matrix from 1000 Genomes, fine-maps it with SuSiE, checks the
+  result, and compares it with Open Targets (if possible).
 - **What you get per study:** a SNP-level results table, a human-readable final report, QC
   summaries for every region, Open Targets comparison tables and plots, and a log of every
   step.
@@ -52,8 +52,8 @@ Words in **bold** that may be unfamiliar are explained in the [Glossary](#glossa
 7. [Choosing studies: the study table](#choosing-studies-the-study-table)
 8. [The munge pipeline, step by step](#the-munge-pipeline-step-by-step)
 9. [The fine-mapping pipeline, step by step](#the-fine-mapping-pipeline-step-by-step)
-10. [Where everything ends up](#where-everything-ends-up)
-11. [Your final files, explained](#your-final-files-explained)
+10. [File tree map](#where-everything-ends-up)
+11. [Final files, explained](#your-final-files-explained)
 12. [Known issues and ideas](#known-issues-and-ideas)
 13. [Glossary](#glossary)
 
@@ -167,9 +167,9 @@ The fine-mapping pipeline needs four kinds of reference data. Their locations ar
 
 #### 1. The 1000 Genomes LD reference panel
 
-LD (how strongly SNPs are inherited together) can't be calculated from GWAS summary statistics,
-so we estimate it from 1000 Genomes individuals of the same ancestry as the study. We use the
-high-coverage (30x) release on genome build GRCh38, in PLINK format, split by ancestry
+LD can't be calculated from GWAS summary statistics, so we use an out-of-reference LD matrix 
+estimated from 1000 Genomes individuals of the same ancestry as the study. We use the 
+high-coverage (30x) release on genome build GRCh38, in PLINK format, split by ancestry 
 (EUR and EAS) and chromosome.
 
 A ready-made copy already exists on the shared drive at
@@ -1066,9 +1066,9 @@ output, so it never runs. `aggregate_ld_matrices` and `aggregate_susie_results` 
 helpers.
 
 
-## Where everything ends up
+## File tree map
 
-Simplified layout for one study, using `350kb_window` and `susieR` as the window and method.
+Simplified layout for one study, using `300kb_window` and `susieR` as the window and method.
 Files marked ★ are the ones most people need.
 
 ```
@@ -1092,11 +1092,11 @@ results/
     │       ├── {study}_ld_flags.tsv          missing-neighbour flag per lead SNP
     │       └── {study}_exclusions.tsv        ★ which loci were excluded and why
     ├── loci_pending/                         one marker per lead SNP (internal)
-    ├── 350kb_window/
+    ├── 300kb_window/
     │   ├── loci_eligible/                    one marker per locus that continues (internal)
     │   └── manhattan_plots_done.txt          internal marker
     ├── {locus}/                              one folder per lead SNP, e.g. rs10486567/
-    │   └── 350kb_window/
+    │   └── 300kb_window/
     │       ├── {locus}_gwas_subset.tsv              GWAS rows in the window
     │       ├── {locus}_gwas_subset_aligned.tsv      same rows, lined up with the LD matrix
     │       ├── LD_block_check/
@@ -1113,9 +1113,9 @@ results/
     │           ├── {locus}_manhattan_plot.pdf       p-values coloured by LD
     │           └── {locus}_opentargets_pip_alignment.pdf   our PIPs vs Open Targets
     └── checking/
-        ├── 350kb_window/
+        ├── 300kb_window/
         │   └── {study}_opentargets_native.tsv       Open Targets credible sets for this study
-        └── susieR/350kb_window/
+        └── susieR/300kb_window/
             ├── study_finalized.txt                  "DONE" when the study is finished
             ├── {study}_final_report.txt             ★ the report to read first
             ├── {study}_snps_table.tsv               ★ all fine-mapped SNPs, study-wide
@@ -1137,7 +1137,7 @@ table picks up the new folders on its own, adding a column pair for the new meth
 [Tracking progress](#tracking-progress)).
 
 
-## Your final files, explained
+## Final files, explained
 
 Start with the **final report**, then use the **SNPs table** for analysis. The QC and Open
 Targets files explain *why* a result looks the way it does.
@@ -1276,7 +1276,7 @@ PICS for older studies). Close agreement is reassuring; big differences are wort
   chrX panel files from the 30x VCFs, which keeps the loci. chrX LD needs care because males
   carry one copy.
 - **Ideas:** run the munge pipeline from inside the fine-mapping pipeline for a fully hands-off
-  run; include studies previously fine-mapped only with PICS; switch on the lead-variant
+  run; switch on the lead-variant
   library comparison (`build_reference_comparison`).
 
 
