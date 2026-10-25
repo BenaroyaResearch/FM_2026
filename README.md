@@ -52,8 +52,8 @@ Words in **bold** that may be unfamiliar are explained in the [Glossary](#glossa
 7. [Choosing studies: the study table](#choosing-studies-the-study-table)
 8. [The munge pipeline, step by step](#the-munge-pipeline-step-by-step)
 9. [The fine-mapping pipeline, step by step](#the-fine-mapping-pipeline-step-by-step)
-10. [File tree map](#where-everything-ends-up)
-11. [Final files, explained](#your-final-files-explained)
+10. [File tree map](#file-tree-map)
+11. [Final files, explained](#final-files-explained)
 12. [Known issues and ideas](#known-issues-and-ideas)
 13. [Glossary](#glossary)
 
